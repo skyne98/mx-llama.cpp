@@ -231,6 +231,7 @@ struct llama_layer_nextn {
     struct ggml_tensor * enorm                 = nullptr;
     struct ggml_tensor * hnorm                 = nullptr;
     struct ggml_tensor * shared_head_head      = nullptr;
+    struct ggml_tensor * h_unrotate            = nullptr; // ruquant: a rotated trunk feeds the MTP block through this
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;

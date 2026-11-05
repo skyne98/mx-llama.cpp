@@ -52,7 +52,10 @@ if (GGML_HIP_RCCL)
 endif()
 
 if (${hip_VERSION} VERSION_LESS 6.1)
-    message(FATAL_ERROR "At least ROCM/HIP V6.1 is required")
+    # ruquant: builds on ROCm 5.7 (MI50 boxes). Its hip_bf16.h defines non-inline host functions, one copy per
+    # translation unit; they are identical, so the linker may keep any.
+    message(WARNING "ruquant: HIP older than 6.1, building anyway")
+    set(GGML_HIP_OLD_ROCM ON)
 endif()
 
 message(STATUS "HIP and hipBLAS found")
@@ -142,3 +145,7 @@ if (GGML_HIP_RCCL)
 endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+
+if (GGML_HIP_OLD_ROCM)
+    target_link_options(ggml-hip PRIVATE -Wl,--allow-multiple-definition)
+endif()

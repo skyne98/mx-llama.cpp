@@ -1103,7 +1103,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
             return src_ss[0];
         }
-        GGML_ABORT("view of permuted tensor not implemented");
+        if (axis >= 0 && axis < GGML_MAX_DIMS) {
+            // A permuted view, or one with overlapping strides (sliding windows along a row), that keeps the whole split
+            // axis at its stride splits along the dim holding it: per device only the strides above it scale, and an
+            // offset inside a row stays as it is (see the simple tensor construction).
+            for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                if (tensor->ne[dim] == tensor->src[0]->ne[axis] && tensor->nb[dim] == tensor->src[0]->nb[axis]) {
+                    ggml_backend_meta_split_state ss = src_ss[0];
+                    ss.axis = ggml_backend_meta_split_axis(dim);
+                    return ss;
+                }
+            }
+        }
+        GGML_ABORT("view of permuted tensor not implemented: %s (of %s, split axis %d)", tensor->name, tensor->src[0]->name, (int) src_ss[0].axis);
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
     };
 
@@ -2416,6 +2428,9 @@ struct ggml_backend_meta_lane_dispatcher {
         ggml_backend_t backend = nullptr;
         ggml_cgraph *  cgraph  = nullptr;
         ggml_status    status  = GGML_STATUS_SUCCESS;
+        // or a recorded token graph to launch (exec != nullptr, cgraph == nullptr)
+        void *         exec    = nullptr;
+        void (*launch)(ggml_backend_t, void *) = nullptr;
     };
 
 
@@ -2429,7 +2444,12 @@ struct ggml_backend_meta_lane_dispatcher {
     std::condition_variable cv_work;   // main -> workers
     std::condition_variable cv_done;   // workers -> main
 
-    static const int spin_iters = 512;
+    // GGML_META_SPIN overrides the spin count (tested on 4x MI50 with schedutil, where sleeping lanes clock down)
+    static int spin_count() {
+        static const int n = getenv("GGML_META_SPIN") ? atoi(getenv("GGML_META_SPIN")) : 512;
+        return n;
+    }
+    const int spin_iters = spin_count();
 
     ~ggml_backend_meta_lane_dispatcher() { shutdown(); }
 
@@ -2490,6 +2510,8 @@ struct ggml_backend_meta_lane_dispatcher {
                     job & jb = jobs[w];
                     if (jb.cgraph != nullptr) {
                         jb.status = ggml_backend_graph_compute_async(jb.backend, jb.cgraph);
+                    } else if (jb.exec != nullptr) {
+                        jb.launch(jb.backend, jb.exec);
                     }
                     if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                         std::lock_guard<std::mutex> lk(mtx);
@@ -2529,6 +2551,7 @@ struct ggml_backend_meta_lane_dispatcher {
                 ret = jb.status;
             }
             jb.cgraph = nullptr;
+            jb.exec   = nullptr;
             jb.status = GGML_STATUS_SUCCESS;
         }
         return ret;
@@ -5052,9 +5075,29 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 uint64_t prof_seam = 0;
                 for (const auto & r : tge->runs) {
                     const size_t lane_lo = r.stage * backend_ctx->tps;
-                    for (size_t k = 0; k < backend_ctx->tps; k++) {
-                        backend_ctx->tg_graph_launch(
-                            backend_ctx->backend_configs[lane_lo + k].backend, r.exec[k]);
+                    auto & disp = backend_ctx->dispatcher;
+                    if (backend_ctx->parallel_dispatch && backend_ctx->tps > 1 && disp.jobs.size() >= backend_ctx->tps - 1) {
+                        // All lanes at once. On ROCm 5.7 a graph launch enqueues its nodes one by one (~1-2 us each)
+                        // after a pass over all of them, so launching four lanes from one thread started the last
+                        // lane ~11 ms after the first, and every all-reduce barrier made the others wait for it.
+                        for (size_t k = 1; k < backend_ctx->tps; k++) {
+                            auto & jb  = disp.jobs[k - 1];
+                            jb.backend = backend_ctx->backend_configs[lane_lo + k].backend;
+                            jb.cgraph  = nullptr;
+                            jb.exec    = r.exec[k];
+                            jb.launch  = backend_ctx->tg_graph_launch;
+                        }
+                        disp.dispatch_async();
+                        backend_ctx->tg_graph_launch(backend_ctx->backend_configs[lane_lo].backend, r.exec[0]);
+                        const ggml_status st = disp.join();
+                        if (st != GGML_STATUS_SUCCESS) {
+                            return st;
+                        }
+                    } else {
+                        for (size_t k = 0; k < backend_ctx->tps; k++) {
+                            backend_ctx->tg_graph_launch(
+                                backend_ctx->backend_configs[lane_lo + k].backend, r.exec[k]);
+                        }
                     }
                     if (r.seam != SIZE_MAX) {
                         const size_t stage_b = backend_ctx->subgraphs[r.seam + 1].stage;

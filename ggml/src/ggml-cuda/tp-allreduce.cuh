@@ -195,6 +195,7 @@ struct CustomARPlan {
     int               blocks     = 0;
     bool              twoshot    = false;
     bool              broadcast  = false;
+    int               wire       = 0;     // broadcast / two-shot payload: 0 f32, 1 bf16, 2 f16 (GGML_TP_AR_WIRE)
 };
 
 // Returns false when the staging allocation cannot be satisfied. No kernels

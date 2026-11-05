@@ -248,6 +248,32 @@ typedef struct {
 } block_q5_1;
 static_assert(sizeof(block_q5_1) == 2 * sizeof(ggml_half) + sizeof(uint32_t) + QK5_1 / 2, "wrong q5_1 block size/padding");
 
+// ruquant W4A4. A row of K (a multiple of 256) int4 codes in [-8, 7], stored as K/256 blocks. Every block of a row
+// repeats the row's unit, so blocks stay self-contained and the codes stay 16-byte aligned for vector loads.
+// Element 8w+j sits in bits [4j+3:4j] of qs[w].
+//   weights:     d = the row's unit s_w; block b's scale is k_b * s_w with an integer k_b in 1..15 stored as
+//                sum = 1 << 30 | k_b (RQ_W_MULT; files from before weight groups hold the row's code sum: k_b = 1),
+//                pad[0] = row length, pad[1] = the activation clip (a float, 0 = unset)
+//   activations: groups of G = 256 / S values (S = 1, 2 or 4 per block), d = the token's unit u, sum = the groups'
+//   zero points z_g in [0, 15] (4 bits each, log2(S) in bits 16..17), pad[0] = their integer scale multipliers m_g
+//   (scale m_g * u, m_g in 1..255, 8 bits each), pad[1] = row length; codes are q - 8
+// total = sum_g (k_b(g) * m_g * (acc_g + (8 - z_g) * colsum_g)) >> RQ_TERM_SHIFT (int32 terms, an arithmetic shift,
+// an int32 sum), acc_g and colsum_g over group g, k_b(g) the weight multiplier of the block holding g;
+// y = fp32((fp32(fp32(total) * 2^RQ_TERM_SHIFT) * u) * s_w). The shift keeps the total in int32 for any input.
+#define QK_W4A4 256
+#define RQ_TERM_SHIFT 4
+#define RQ_W_MULT(sum) ((((uint32_t) (sum)) >> 30) == 1u ? (int32_t) ((sum) & 0xF) : 1)
+// weight groups of 64 (ruquant convert --wgroups 64): sum = 1 << 30 | 1 << 29 | k0 | k1 << 4 | k2 << 8 | k3 << 12, the
+// multiplier of inputs 64 g .. 64 g + 63 of the block; other blocks have one k for all four
+#define RQ_W_MULT_G(sum, g) ((((uint32_t) (sum)) >> 29) == 3u ? (int32_t) ((((uint32_t) (sum)) >> (4 * (g))) & 0xF) : RQ_W_MULT(sum))
+typedef struct {
+    float    d;
+    int32_t  sum;
+    int32_t  pad[2];
+    uint32_t qs[QK_W4A4 / 8];
+} block_w4a4;
+static_assert(sizeof(block_w4a4) == 144, "wrong w4a4 block size/padding");
+
 #define QK8_0 32
 typedef struct {
     ggml_half d;       // delta

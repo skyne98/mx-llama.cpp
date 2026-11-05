@@ -449,6 +449,12 @@ void launch_mul_mat_vec_f_cuda(
             block_size_best = block_size;
         }
     }
+    // Too few rows to fill the device (e.g. the 48-row DeltaNet alpha/beta projections): each block is then one
+    // long latency-bound loop, so give it more waves. 5120 x 48 at 6 tokens on gfx906: 19 us with 128 threads.
+    const int64_t nblocks = nrows * nchannels_dst * nsamples_or_ntokens;
+    if (nblocks < ggml_cuda_info().devices[device].nsm && ncols >= 2*1024*2) {
+        block_size_best = 1024;
+    }
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
@@ -500,6 +506,12 @@ void launch_mul_mat_vec_f_cuda(
         } break;
         case  256: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 256, is_multi_token_id>
+                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
+        } break;
+        case 1024: {
+            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 1024, is_multi_token_id>
                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
@@ -791,6 +803,9 @@ void ggml_cuda_op_mul_mat_vec_f(
 }
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
+    if (type == GGML_TYPE_W4A4 || type == GGML_TYPE_W4A4H) {
+        return false; // ruquant: its own path, rq-w4a4.cu
+    }
     if (src0_ne[0] % 2 != 0) {
         return false;
     }

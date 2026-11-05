@@ -633,6 +633,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g, layer.wk_s);
             const bool shared_kv = layer.wv == nullptr;
             ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, inp_g, layer.wv_s);
+            // next to each other in the graph, so a backend can run projections of one input as one launch
+            ggml_build_forward_expand(gf, Kcur);
+            ggml_build_forward_expand(gf, Vcur);
 
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
@@ -724,6 +727,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_tensor * Kcur = build_lora_mm(layer.wk, noise_norm, layer.wk_s);
         const bool shared_kv = layer.wv == nullptr;
         ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, noise_norm, layer.wv_s);
+        // next to each other in the graph (see above)
+        ggml_build_forward_expand(gf, Qcur);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
 
         Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
         Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);

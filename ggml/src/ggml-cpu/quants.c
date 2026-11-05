@@ -448,6 +448,41 @@ void ggml_vec_dot_q5_1_q8_1_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
+// ruquant W4A4: x is one weight row (W4A4 / W4A4H), y one activation row (A4 / A4H), n = K. Per activation group g
+// (see rq_quantize_row_a in ggml-quants.c): acc_g + (8 - z_g) * colsum_g, times the group's integer multiplier m_g
+// and its weight block's k_b, shifted right by RQ_TERM_SHIFT; the int32 total is exact in any order. Then the spec's
+// fp32 epilogue: total * 16 * u * s_w.
+void ggml_vec_dot_w4a4_a4(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    assert(n % QK_W4A4 == 0);
+    UNUSED(nrc); UNUSED(bs); UNUSED(bx); UNUSED(by);
+    const block_w4a4 * GGML_RESTRICT x = vx;
+    const block_w4a4 * GGML_RESTRICT y = vy;
+    const int nb = n / QK_W4A4;
+    int32_t total = 0;
+    for (int b = 0; b < nb; ++b) {
+        const int lsub = (y[b].sum >> 16) & 3, gw = (QK_W4A4 / 8) >> lsub; // words per group
+        for (int sg = 0; sg < 1 << lsub; ++sg) {
+            int32_t acc = 0, colsum = 0;
+            for (int w = sg*gw; w < (sg + 1)*gw; ++w) {
+                const uint32_t wx = x[b].qs[w], wy = y[b].qs[w];
+                for (int j = 0; j < 8; ++j) {
+                    const int32_t cx = (int32_t) (((wx >> (4*j)) & 0xF) << 28) >> 28;
+                    const int32_t cy = (int32_t) (((wy >> (4*j)) & 0xF) << 28) >> 28;
+                    acc += cx * cy;
+                    colsum += cx;
+                }
+            }
+            const int32_t z = (y[b].sum >> (4*sg)) & 0xF, m = (int32_t) (((uint32_t) y[b].pad[0] >> (8*sg)) & 0xFF);
+            // weight groups of 64 (RQ_W_MULT_G) need activation groups of 64: one multiplier per activation group
+            GGML_ASSERT(lsub == 2 || (((uint32_t) x[b].sum) >> 29) != 3u);
+            const int32_t kw = RQ_W_MULT_G(x[b].sum, sg << (2 - lsub));
+            total += (kw * m * (acc + (8 - z) * colsum)) >> RQ_TERM_SHIFT; // |term| < 2^27
+        }
+    }
+    *s = (((float) total * (float) (1 << RQ_TERM_SHIFT)) * y[0].d) * x[0].d;
+}
+
 void ggml_vec_dot_q8_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;

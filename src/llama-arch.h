@@ -749,6 +749,7 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_ENORM,
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
+    LLM_TENSOR_NEXTN_H_UNROTATE, // ruquant: back to the MTP block's basis
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
     LLM_TENSOR_NEXTN_HC_HEAD_NORM, // qwen4exp: the MTP block's own hyper-connection mixer
     LLM_TENSOR_NEXTN_HC_HEAD_DOWN,

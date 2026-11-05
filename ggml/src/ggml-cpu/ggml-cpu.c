@@ -7,6 +7,7 @@
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "quants.h"
+#include "ggml-quants.h" // ruquant W4A4 reference quantizers
 #include "ggml-threading.h"
 #include "unary-ops.h"
 #include "binary-ops.h"
@@ -268,6 +269,24 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot                  = ggml_vec_dot_q5_1_q8_1,
         .vec_dot_type             = GGML_TYPE_Q8_1,
         .nrows                    = 1,
+    },
+    [GGML_TYPE_W4A4] = {
+        .from_float               = (ggml_from_float_t) quantize_row_w4a4_ref,
+        .vec_dot                  = ggml_vec_dot_w4a4_a4,
+        .vec_dot_type             = GGML_TYPE_A4,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_W4A4H] = {
+        .from_float               = (ggml_from_float_t) quantize_row_w4a4h_ref,
+        .vec_dot                  = ggml_vec_dot_w4a4_a4,
+        .vec_dot_type             = GGML_TYPE_A4H,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_A4] = {
+        .from_float               = (ggml_from_float_t) quantize_row_a4_ref,
+    },
+    [GGML_TYPE_A4H] = {
+        .from_float               = (ggml_from_float_t) quantize_row_a4h_ref,
     },
     [GGML_TYPE_Q8_0] = {
         .from_float               = quantize_row_q8_0,
@@ -1340,17 +1359,25 @@ UseGgmlGemm1:;
         GGML_ASSERT(!widen || vec_dot_type == GGML_TYPE_F32);
         GGML_ASSERT(!widen || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
 
-    #if 0
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
-                                ne10);
+        // ruquant A4 / A4H quantize per token (min/max over the whole row, Hadamard per block of the weight's length): rows per thread
+        if (vec_dot_type == GGML_TYPE_A4 || vec_dot_type == GGML_TYPE_A4H) {
+            const bool had = vec_dot_type == GGML_TYPE_A4H;
+            const float clip = ggml_rq_act_clip_for(ggml_rq_tensor_clip(src0->data), had); // the weight's clip
+            const int64_t n_rot = had ? ggml_rq_tensor_rot(src0->data, ne10) : 0;          // and Hadamard length
+            for (int64_t i13 = 0; i13 < ne13; ++i13) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                        float * x = (float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
+                        block_w4a4 * y = (block_w4a4 *) (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1);
+                        if (had) {
+                            quantize_row_a4h_clip_n(x, y, ne10, clip, n_rot);
+                        } else {
+                            quantize_row_a4_clip(x, y, ne10, clip);
+                        }
+                    }
                 }
             }
-        }
-    #else
+        } else {
         const int64_t bs = ggml_blck_size(vec_dot_type);
 
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1373,7 +1400,7 @@ UseGgmlGemm1:;
                 }
             }
         }
-    #endif
+        }
     }
 
     if (ith == 0) {

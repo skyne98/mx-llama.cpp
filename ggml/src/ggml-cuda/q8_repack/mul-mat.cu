@@ -220,7 +220,11 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
     const int64_t min_grid  = 2LL * nsm;
     const bool    work_ok   = n_blocks >= RP_NC_MIN_ACCUM * RP_NC_LANES_WIDE;
     const bool    lanes16_ok = work_ok && (ne01 + 31) / 32 >= min_grid;
+    const bool    lanes16_tall = work_ok && (ne01 + 31) / 32 >= 8LL * nsm;
     const bool    lanes32_ok = work_ok && (ne01 +  7) /  8 >= min_grid;
+    // Widths 4-8 take the 16-lane group on tall matrices, with two rows per lane so each activation block is read
+    // once for both: Qwen3.8-27B's lm_head (248320 x 5120, gfx906, 6 columns) 3.08 -> 2.30 ms. At 5120 rows
+    // (ssm_out) it was no faster, and one row per lane at 16 lanes was slower everywhere.
     switch (ne11) {
         case 2: {
             if (lanes16_ok) {
@@ -247,29 +251,64 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
             }
         } break;
         case 4: {
-            const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 4, 2, 64, WT><<<grid, 64, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            if (lanes16_tall) {
+                // 16 lanes to a row, two rows per lane, 32 rows per block
+                const dim3 grid((ne01 + 31) / 32, 1, 1);
+                mul_mat_vec_repacked_nc<32, 4, 4, 2, 16, WT><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            } else {
+                const dim3 grid((ne01 + 1) / 2, 1, 1);
+                mul_mat_vec_repacked_nc<2, 1, 4, 2, 64, WT><<<grid, 64, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            }
         } break;
         case 5: {
-            const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 5, 2, 64, WT><<<grid, 64, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            if (lanes16_tall) {
+                // 16 lanes to a row, two rows per lane, 32 rows per block
+                const dim3 grid((ne01 + 31) / 32, 1, 1);
+                mul_mat_vec_repacked_nc<32, 4, 5, 2, 16, WT><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            } else {
+                const dim3 grid((ne01 + 1) / 2, 1, 1);
+                mul_mat_vec_repacked_nc<2, 1, 5, 2, 64, WT><<<grid, 64, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            }
         } break;
         case 6: {
-            const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 6, 2, 64, WT><<<grid, 64, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            if (lanes16_tall) {
+                // 16 lanes to a row, two rows per lane, 32 rows per block
+                const dim3 grid((ne01 + 31) / 32, 1, 1);
+                mul_mat_vec_repacked_nc<32, 4, 6, 2, 16, WT><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            } else {
+                const dim3 grid((ne01 + 1) / 2, 1, 1);
+                mul_mat_vec_repacked_nc<2, 1, 6, 2, 64, WT><<<grid, 64, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            }
         } break;
         case 7: {
-            const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 7, 2, 64, WT><<<grid, 64, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            if (lanes16_tall) {
+                // 16 lanes to a row, two rows per lane, 32 rows per block
+                const dim3 grid((ne01 + 31) / 32, 1, 1);
+                mul_mat_vec_repacked_nc<32, 4, 7, 2, 16, WT><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            } else {
+                const dim3 grid((ne01 + 1) / 2, 1, 1);
+                mul_mat_vec_repacked_nc<2, 1, 7, 2, 64, WT><<<grid, 64, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            }
         } break;
         case 8: {
-            const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 8, 2, 64, WT><<<grid, 64, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            if (lanes16_tall) {
+                // 16 lanes to a row, two rows per lane, 32 rows per block
+                const dim3 grid((ne01 + 31) / 32, 1, 1);
+                mul_mat_vec_repacked_nc<32, 4, 8, 2, 16, WT><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            } else {
+                const dim3 grid((ne01 + 1) / 2, 1, 1);
+                mul_mat_vec_repacked_nc<2, 1, 8, 2, 64, WT><<<grid, 64, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            }
         } break;
         default: GGML_ABORT("nc mat-vec: unsupported batch width");
     }

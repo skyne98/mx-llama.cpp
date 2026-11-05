@@ -506,6 +506,8 @@ private:
 
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
+    int64_t         trace_params_us = 0, trace_build_us = 0, trace_inputs_us = 0, trace_compute_us = 0, trace_check_us = 0, trace_drain_us = 0; // LLAMA_STEP_TRACE
+    int32_t         trace_n     = 0;
 
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls

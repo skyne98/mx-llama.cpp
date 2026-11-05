@@ -5197,6 +5197,9 @@ struct test_mul_mat : public test_case {
                 backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
+        if (type_a == GGML_TYPE_W4A4 || type_a == GGML_TYPE_W4A4H) {
+            return 0.0; // ruquant: every backend must reproduce the CPU reference bit for bit
+        }
         return max_nmse_err();
     }
 
@@ -5298,6 +5301,51 @@ struct test_mul_mat : public test_case {
         }
 
         return out;
+    }
+
+    // ruquant W4A4: activations whose 64-wide groups differ in scale (x1/8 .. x8, times a per-token factor), so the
+    // activation group multipliers are exercised, and weights whose 64-wide groups do (x1/4 .. x4, for RQ_WGROUP=1 and
+    // RQ_WGROUP=64, whose four multipliers per block then differ). Every
+    // 7th weight row is flat (+-1) and, for W4A4, every 5th token takes weight row 0's signs: aligned flat rows, like
+    // a rotated massive activation, whose dot product passes 2^31 in the kernels' integer units at K = 17408.
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        if (type_a != GGML_TYPE_W4A4 && type_a != GGML_TYPE_W4A4H) {
+            return;
+        }
+        std::vector<float> w;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "a") == 0 && t->type == type_a && ggml_is_contiguous(t)) {
+                const int64_t n = t->ne[0], rows = ggml_nrows(t);
+                w.resize(n * rows);
+                std::mt19937 rng(1234);
+                std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+                for (int64_t r = 0; r < rows; ++r) {
+                    for (int64_t i = 0; i < n; ++i) {
+                        const float v = dist(rng);
+                        w[r * n + i] = r % 7 == 0 ? (v < 0.0f ? -1.0f : 1.0f) : v * exp2f((float) ((i / 64 + r) % 5 - 2));
+                    }
+                }
+                std::vector<uint8_t> q(ggml_nbytes(t));
+                ggml_quantize_chunk(t->type, w.data(), q.data(), 0, rows, n, nullptr);
+                ggml_backend_tensor_set(t, q.data(), 0, q.size());
+            }
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "b") != 0 || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+                continue;
+            }
+            std::vector<float> v(ggml_nelements(t));
+            ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
+            for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    const bool aligned = type_a == GGML_TYPE_W4A4 && r % 5 == 0 && (int64_t) w.size() >= t->ne[0];
+                    v[r * t->ne[0] + i] = aligned ? (w[i] < 0.0f ? -1.0f : 1.0f)
+                                                  : v[r * t->ne[0] + i] * exp2f((float) ((i / 64) % 7 - 3) + (float) (r % 3 - 1));
+                }
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+        }
     }
 
     bool run_whole_graph() override { return o > 1; }
@@ -10632,6 +10680,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
+
+    // ruquant W4A4 / W4A4H: backends against the CPU reference (expected bit-identical)
+    for (ggml_type type_a : {GGML_TYPE_W4A4, GGML_TYPE_W4A4H}) {
+        for (int64_t n : {1, 3, 8, 17, 64, 200}) {
+            for (int64_t k : {256, 512, 1536, 5120, 6144}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 136, n, k, {1, 1}, {1, 1}));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 5120, 32, 17408, {1, 1}, {1, 1}));
+        // the skinny dot8 path (rows a multiple of 64): every verify width, and widths that pad or chunk
+        for (int64_t n : {1, 2, 4, 5, 8, 16, 24, 32, 48, 64, 65, 130}) {
+            for (int64_t k : {256, 6144}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, k, {1, 1}, {1, 1}));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 192, 8, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, 8, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 5120, 8, 17408, {1, 1}, {1, 1}));
+    }
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {

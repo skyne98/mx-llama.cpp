@@ -316,6 +316,9 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+    if (type == GGML_TYPE_W4A4 || type == GGML_TYPE_W4A4H) {
+        return false; // ruquant: its own path, rq-w4a4.cu
+    }
     if (!ggml_is_quantized(type)) {
         return false;
     }

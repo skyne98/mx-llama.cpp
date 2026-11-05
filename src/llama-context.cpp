@@ -1789,16 +1789,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // LLAMA_STEP_TRACE=1: host time of graph build/reuse, input upload and graph dispatch for small ubatches (the
+    // speculative verify and the drafter), averaged and logged every 256 calls per context
+    static const bool step_trace = getenv("LLAMA_STEP_TRACE") != nullptr;
+    const int64_t t_start_us = step_trace ? ggml_time_us() : 0;
+
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    const int64_t t_params_us = step_trace ? ggml_time_us() : 0;
 
     bool graph_sequence_layout_changed = false;
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    const bool reuse = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
+    const int64_t t_check_us = step_trace ? ggml_time_us() : 0;
+    int64_t t_drain_us = 0;
+    if (reuse) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1815,7 +1824,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return env && atoi(env) != 0;
         }();
         if (cparams.pipeline_parallel && !reuse_no_drain) {
+            const int64_t t0 = step_trace ? ggml_time_us() : 0;
             ggml_backend_sched_synchronize(sched.get());
+            t_drain_us = step_trace ? ggml_time_us() - t0 : 0;
         }
 
         n_reused++;
@@ -1841,7 +1852,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        const int64_t t_build0_us = step_trace ? ggml_time_us() : 0;
         gf = model.build_graph(gparams);
+        const int64_t t_build1_us = step_trace ? ggml_time_us() : 0;
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1856,21 +1869,39 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        if (step_trace && ubatch.n_tokens <= 16 && model.hparams.n_layer() > 8) {
+            LLAMA_LOG_INFO("%s: step trace rebuild: %d tokens, build %.2f ms, alloc %.2f ms\n", __func__,
+                    (int) ubatch.n_tokens, (t_build1_us - t_build0_us) * 1e-3, (ggml_time_us() - t_build1_us) * 1e-3);
+        }
 
         gf_res_prev_active = res;
     }
 
+    const int64_t t_inputs_us = step_trace ? ggml_time_us() : 0;
+
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
-
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
-
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_compute_us = step_trace ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (step_trace && ubatch.n_tokens <= 16) {
+        trace_params_us  += t_params_us - t_start_us;
+        trace_build_us   += t_inputs_us - t_start_us;
+        trace_check_us   += t_check_us - t_params_us;
+        trace_drain_us   += t_drain_us;
+        trace_inputs_us  += t_compute_us - t_inputs_us;
+        trace_compute_us += ggml_time_us() - t_compute_us;
+        if (++trace_n % 256 == 0) {
+            LLAMA_LOG_INFO("%s: step trace (%d layers), %d small ubatches, ms each: graph build/reuse %.3f (params %.3f, "
+                    "reuse check %.3f, reuse drain %.3f) inputs %.3f dispatch %.3f, %d reused\n", __func__,
+                    (int) model.hparams.n_layer(), trace_n, trace_build_us*1e-3/trace_n, trace_params_us*1e-3/trace_n,
+                    trace_check_us*1e-3/trace_n, trace_drain_us*1e-3/trace_n, trace_inputs_us*1e-3/trace_n,
+                    trace_compute_us*1e-3/trace_n, n_reused);
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         if (mctx) {
             mctx->finish_compute(false);

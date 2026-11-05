@@ -430,7 +430,12 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // 43: GGML_TYPE_F8_E4M3 upstream; kept free so ruquant GGUFs use the same type ids everywhere
+        GGML_TYPE_W4A4    = 44, // ruquant: int4 per-row weights x int4 per-token activations (dot8 / int4 mma)
+        GGML_TYPE_W4A4H   = 45, // ruquant: W4A4 with an online Hadamard on the activations
+        GGML_TYPE_A4      = 46, // ruquant: per-token asymmetric int4 activations, the vec_dot type of W4A4
+        GGML_TYPE_A4H     = 47, // ruquant: A4 after the online Hadamard, the vec_dot type of W4A4H
+        GGML_TYPE_COUNT   = 48,
     };
 
     // [TAG_GGML_PREC]

@@ -125,6 +125,11 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    // the chain is plain greedy (one temperature-0 or top-k-1 sampler, no logit bias, grammar, reasoning budget or
+    // probabilities): sample takes the argmax of the logits instead of building the n_vocab candidate list, which is
+    // ~0.5 ms per row at a 248k vocabulary, 8 rows per verify step when the backend cannot sample (-sm tensor)
+    bool greedy_argmax = false;
+
     void reset() {
         prev.clear();
 
@@ -327,6 +332,7 @@ struct common_sampler * common_sampler_init(
     }
 
     // logit bias: user biases + model suppress tokens (-INFINITY)
+    bool has_bias = false;
     {
         std::vector<llama_logit_bias> merged = params.logit_bias;
 
@@ -338,6 +344,7 @@ struct common_sampler * common_sampler_init(
 
         if (!merged.empty()) {
             samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
+            has_bias = true;
         }
     }
 
@@ -442,6 +449,10 @@ struct common_sampler * common_sampler_init(
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
+    result->greedy_argmax = !grmr && !rbudget && !has_bias && params.mirostat == 0 && params.n_probs == 0 &&
+        params.samplers.size() == 1 &&
+        ((params.samplers[0] == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
+         (params.samplers[0] == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
 
     return result;
 }
@@ -614,6 +625,43 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & rbudget = gsmpl->rbudget;
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+
+    if (gsmpl->greedy_argmax && llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL &&
+            !llama_get_sampled_logits_ith(ctx, idx) && !llama_get_sampled_probs_ith(ctx, idx)) {
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        // the first maximum, as the temperature-0 and greedy samplers keep: the maximum in 8 independent lanes
+        // (x > m ? x : m maps onto vector max, so this vectorizes), then the first index holding it
+        float lane[8];
+        for (int k = 0; k < 8; k++) {
+            lane[k] = logits[0];
+        }
+        llama_token t = 0;
+        for (; t + 8 <= n_vocab; t += 8) {
+            for (int k = 0; k < 8; k++) {
+                lane[k] = logits[t + k] > lane[k] ? logits[t + k] : lane[k];
+            }
+        }
+        float vmax = lane[0];
+        for (int k = 1; k < 8; k++) {
+            vmax = lane[k] > vmax ? lane[k] : vmax;
+        }
+        for (; t < n_vocab; t++) {
+            vmax = logits[t] > vmax ? logits[t] : vmax;
+        }
+        llama_token best = 0;
+        for (llama_token u = 0; u < n_vocab; u++) {
+            if (logits[u] == vmax) {
+                best = u;
+                break;
+            }
+        }
+        gsmpl->cur.resize(1);
+        gsmpl->cur[0] = llama_token_data{best, logits[best], 0.0f};
+        cur_p = { gsmpl->cur.data(), 1, 0, false };
+        return best;
+    }
 
     gsmpl->set_logits(ctx, idx);
 

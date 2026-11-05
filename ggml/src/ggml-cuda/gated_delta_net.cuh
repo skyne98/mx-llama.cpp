@@ -3,11 +3,24 @@
 
 // fused-kernel recurrent-state output; strides in elements (per-seq stride is always D, set in-kernel)
 struct ggml_cuda_gated_delta_net_fused_cache {
-    float * data;        // rollback slot 0
+    float * data;        // rollback slot 0, or the cache base when rows is set
     int64_t slot_stride; // between rollback slots (0 when K==1)
+    const int32_t * rows = nullptr; // ring layout: cache row of each (slot, seq), I32 [n_seqs * n_written]
+    int64_t row_stride   = 0;       // between cache rows
 };
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// where a gated_delta_net reads its initial state when the get_rows that copies it out of the cache is skipped
+// (see ggml_cuda_try_gdn_state_read): state of sequence j = base + rows[j] * stride. Set while evaluating a graph,
+// taken (and cleared) by the op.
+struct ggml_cuda_gdn_state_src {
+    const float * base   = nullptr;
+    const int32_t * rows = nullptr;
+    int64_t stride       = 0;
+};
+void ggml_cuda_gdn_state_src_set(const ggml_tensor * gdn, ggml_cuda_gdn_state_src src);
+ggml_cuda_gdn_state_src ggml_cuda_gdn_state_src_take(const ggml_tensor * gdn);
 
 // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
 void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,

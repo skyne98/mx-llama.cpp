@@ -3151,6 +3151,53 @@ private:
     }
 
     // @ngxson : for debugging only
+    // LLAMA_STEP_TRACE=1: host time of each speculative step by phase, averaged and logged every 64 steps.
+    // A step runs from the draft call to the end of post_decode; "other" is the gap until the next draft.
+    struct step_trace_t {
+        enum phase { DRAFT, PREP, LAUNCH, SYNC, INJECT, ACCEPT, ROLLBACK, OUTPUT, OTHER, N_PHASE };
+        const bool on = getenv("LLAMA_STEP_TRACE") != nullptr;
+        bool    in_step = false;
+        int64_t t_mark  = 0;
+        int64_t t_end   = 0;
+        int64_t n       = 0;
+        int64_t acc[N_PHASE] = {0};
+
+        void begin() {
+            if (!on) {
+                return;
+            }
+            const int64_t t = ggml_time_us();
+            if (t_end > 0 && t - t_end < 20000) { // a longer gap is a new request, not part of a step
+                acc[OTHER] += t - t_end;
+            }
+            in_step = true;
+            t_mark  = t;
+        }
+        void mark(phase p) {
+            if (!on || !in_step) {
+                return;
+            }
+            const int64_t t = ggml_time_us();
+            acc[p] += t - t_mark;
+            t_mark  = t;
+        }
+        void end() {
+            if (!on || !in_step) {
+                return;
+            }
+            mark(OUTPUT);
+            in_step = false;
+            t_end   = t_mark;
+            if (++n % 64 == 0) {
+                const double k = 1e-3/n;
+                SRV_INF("step trace, %" PRId64 " steps, ms per step: draft %.2f prep %.2f launch %.2f sync %.2f inject %.2f "
+                        "accept %.2f rollback %.2f output %.2f other %.2f\n", n, acc[DRAFT]*k, acc[PREP]*k, acc[LAUNCH]*k,
+                        acc[SYNC]*k, acc[INJECT]*k, acc[ACCEPT]*k, acc[ROLLBACK]*k, acc[OUTPUT]*k, acc[OTHER]*k);
+            }
+        }
+    };
+    step_trace_t step_trace;
+
     int64_t t_pre_decode  = 0;
     int64_t t_decode      = 0;
     int64_t t_post_decode = 0;
@@ -3286,6 +3333,7 @@ private:
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off);
+                step_trace.end();
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
@@ -3442,9 +3490,11 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            step_trace.begin();
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            step_trace.mark(step_trace_t::DRAFT);
         }
 
         // make checkpoints if needed
@@ -4257,10 +4307,13 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            step_trace.mark(step_trace_t::PREP);
             ret = reserve_prompt_graph(off) ? llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get()) : -2;
+            step_trace.mark(step_trace_t::LAUNCH);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            step_trace.mark(step_trace_t::SYNC);
         });
 
         if (ret != 0) {
@@ -4324,6 +4377,7 @@ private:
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
             });
+            step_trace.mark(step_trace_t::INJECT);
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -4517,6 +4571,7 @@ private:
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
+                step_trace.mark(step_trace_t::ACCEPT);
                 // logits row of each verify position, kept for the token probabilities below
                 slot.spec_i_batch_last = slot.spec_i_batch;
                 slot.spec_i_batch.clear();
@@ -4599,6 +4654,7 @@ private:
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            step_trace.mark(step_trace_t::ROLLBACK);
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;

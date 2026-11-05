@@ -2109,7 +2109,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
         auto * dev = devices.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
-        if (il >= (int) hparams.n_layer()) {
+        // NextN/MTP blocks only (il == n_layer_all is the output layer, whose lm_head runs at verify width,
+        // where the repacked narrow mat-vec beats the canonical one)
+        if (il >= (int) hparams.n_layer() && il < n_layer_all) {
             return {dev, &pimpl->gpu_buft_list_plain.at(dev)};
         }
         return {dev, &pimpl->gpu_buft_list.at(dev)};

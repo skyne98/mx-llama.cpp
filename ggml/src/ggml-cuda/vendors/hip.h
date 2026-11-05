@@ -123,7 +123,15 @@
 #define cudaStreamNonBlocking hipStreamNonBlocking
 #define cudaStreamPerThread hipStreamPerThread
 #define cudaStreamSynchronize hipStreamSynchronize
+#if HIP_VERSION < 60100000
+// ruquant: ROCm 5.x has no default for the flags argument
+static inline hipError_t ggml_hip_stream_wait_event(hipStream_t stream, hipEvent_t event, unsigned int flags = 0) {
+    return hipStreamWaitEvent(stream, event, flags);
+}
+#define cudaStreamWaitEvent ggml_hip_stream_wait_event
+#else
 #define cudaStreamWaitEvent hipStreamWaitEvent
+#endif
 #define cudaGraphExec_t hipGraphExec_t
 #define cudaGraphNode_t hipGraphNode_t
 #define cudaKernelNodeParams hipKernelNodeParams

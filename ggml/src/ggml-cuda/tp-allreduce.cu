@@ -601,6 +601,165 @@ k_twoshot_f32(
     }
 }
 
+// ----------------------------------------------------------------------------
+// 16-bit-on-wire variants of the broadcast and two-shot kernels (GGML_TP_AR_WIRE = f16, the default, or bf16; f32
+// keeps the kernels above). On PCIe 3.0 the peer writes are the whole cost of a decode-sized AllReduce, so half the
+// bytes is nearly half the time. Each rank rounds its own contribution exactly as its peers see it, and the two-shot
+// allgather sends the rounded sum, so every rank still gets bit-identical results (the rounded sum of rounded
+// partials, as in NCCL's BF16 ring). f16 saturates at +-65504; its 11-bit mantissa matters for W4A4 models, where
+// bf16 rounding of every layer output cost 4% KLD and some draft acceptance at TP = 4, f16 nothing measurable.
+// Eight elements per thread: one 16-byte peer write. Needs n_elements % (8 * NRANKS) == 0.
+// ----------------------------------------------------------------------------
+template <bool F16>
+static __device__ __forceinline__ uint32_t ar_pack2(float a, float b) {
+    if constexpr (F16) {
+        const float lim = 65504.0f;
+        const uint32_t ha = __half_as_ushort(__float2half_rn(fminf(fmaxf(a, -lim), lim)));
+        const uint32_t hb = __half_as_ushort(__float2half_rn(fminf(fmaxf(b, -lim), lim)));
+        return ha | hb << 16;
+    } else {
+        uint32_t ua = __float_as_uint(a), ub = __float_as_uint(b);
+        ua += 0x7FFFu + ((ua >> 16) & 1u); // bf16, round to nearest even; AllReduce inputs are finite
+        ub += 0x7FFFu + ((ub >> 16) & 1u);
+        return (ua >> 16) | (ub & 0xFFFF0000u);
+    }
+}
+
+template <bool F16>
+static __device__ __forceinline__ float ar_lo(uint32_t w) {
+    if constexpr (F16) { return __half2float(__ushort_as_half((unsigned short) (w & 0xFFFFu))); }
+    else               { return __uint_as_float(w << 16); }
+}
+
+template <bool F16>
+static __device__ __forceinline__ float ar_hi(uint32_t w) {
+    if constexpr (F16) { return __half2float(__ushort_as_half((unsigned short) (w >> 16))); }
+    else               { return __uint_as_float(w & 0xFFFF0000u); }
+}
+
+template <bool F16>
+static __device__ __forceinline__ uint4 ar_pack8(const float * __restrict__ x) { // x 16-byte aligned, global
+    const float4 a = ((const float4 *) x)[0], b = ((const float4 *) x)[1];
+    return make_uint4(ar_pack2<F16>(a.x, a.y), ar_pack2<F16>(a.z, a.w), ar_pack2<F16>(b.x, b.y), ar_pack2<F16>(b.z, b.w));
+}
+
+template <bool F16>
+static __device__ __forceinline__ uint4 ar_pack8_regs(const float (&f)[8]) {
+    return make_uint4(ar_pack2<F16>(f[0], f[1]), ar_pack2<F16>(f[2], f[3]), ar_pack2<F16>(f[4], f[5]), ar_pack2<F16>(f[6], f[7]));
+}
+
+template <bool F16>
+static __device__ __forceinline__ void ar_add8(float * s, uint4 p) {
+    const uint32_t w[4] = { p.x, p.y, p.z, p.w };
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        s[2*i]     += ar_lo<F16>(w[i]);
+        s[2*i + 1] += ar_hi<F16>(w[i]);
+    }
+}
+
+template <bool F16>
+static __device__ __forceinline__ void ar_store8(float * __restrict__ y, uint4 p) {
+    float f[8] = {};
+    ar_add8<F16>(f, p);
+    ((float4 *) y)[0] = make_float4(f[0], f[1], f[2], f[3]);
+    ((float4 *) y)[1] = make_float4(f[4], f[5], f[6], f[7]);
+}
+
+// peer-written data: NT loads so they come from HBM, not a stale L2 line
+static __device__ __forceinline__ uint4 ar_load_nt(const uint4 * p) {
+#if defined(GGML_USE_HIP)
+    const uint32_t * q = (const uint32_t *) p;
+    return make_uint4(__builtin_nontemporal_load(q), __builtin_nontemporal_load(q + 1),
+                      __builtin_nontemporal_load(q + 2), __builtin_nontemporal_load(q + 3));
+#else
+    return *p;
+#endif
+}
+
+template <int NRANKS, bool F16>
+__global__ void __launch_bounds__(kThreads, 1)
+k_broadcast_reduce_16(RankData * __restrict__ _dp, RankSignals sg, Signal * __restrict__ self_sg,
+                      const float * __restrict__ input, float * __restrict__ result, int rank, int64_t n_elements) {
+    auto dp = *_dp;
+    const int64_t n8 = n_elements / 8;
+    for (int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; idx < n8; idx += (int64_t) gridDim.x * blockDim.x) {
+        const uint4 p = ar_pack8<F16>(input + idx * 8);
+#pragma unroll
+        for (int r = 0; r < NRANKS; r++) {
+            if (r == rank) continue;
+            ((uint4 *)(uintptr_t) dp.ptrs[r])[(int64_t) rank * n8 + idx] = p;
+        }
+    }
+    __syncthreads();
+    __threadfence_system();
+    barrier_start<NRANKS>(sg, self_sg, rank);
+
+    const uint4 * own = (const uint4 *) dp.ptrs[rank];
+    for (int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; idx < n8; idx += (int64_t) gridDim.x * blockDim.x) {
+        float sum[8] = {};
+#pragma unroll
+        for (int r = 0; r < NRANKS; r++) {
+            ar_add8<F16>(sum, r == rank ? ar_pack8<F16>(input + idx * 8) : ar_load_nt(own + (int64_t) r * n8 + idx));
+        }
+        ((float4 *) result)[2*idx]     = make_float4(sum[0], sum[1], sum[2], sum[3]);
+        ((float4 *) result)[2*idx + 1] = make_float4(sum[4], sum[5], sum[6], sum[7]);
+    }
+    barrier_end<NRANKS>(sg, self_sg, rank);
+}
+
+// Staging as in k_twoshot_f32, in 16 bits: scatter slots from the base, allgather slots from the same byte offset
+// (ag_offset floats) as the f32 kernel.
+template <int NRANKS, bool F16>
+__global__ void __launch_bounds__(kThreads, 1)
+k_twoshot_16(RankData * __restrict__ _dp, RankSignals sg, Signal * __restrict__ self_sg,
+             const float * __restrict__ input, float * __restrict__ result, int rank, int64_t n_elements,
+             int64_t ag_offset) {
+    auto dp = *_dp;
+    const int64_t slice8 = n_elements / NRANKS / 8; // slice in 8-element units
+    auto scat = [&](int r) -> uint4 * { return (uint4 *)(uintptr_t) dp.ptrs[r]; };
+    auto ag   = [&](int r) -> uint4 * { return (uint4 *)(uintptr_t) dp.ptrs[r] + ag_offset / 4; };
+
+#pragma unroll
+    for (int t = 1; t < NRANKS; t++) {
+        const int target = (rank + t) % NRANKS;
+        for (int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; idx < slice8; idx += (int64_t) gridDim.x * blockDim.x) {
+            scat(target)[(int64_t) rank * slice8 + idx] = ar_pack8<F16>(input + ((int64_t) target * slice8 + idx) * 8);
+        }
+    }
+    __syncthreads();
+    __threadfence_system();
+    barrier_start<NRANKS>(sg, self_sg, rank);
+
+    const uint4 * own = scat(rank);
+    for (int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; idx < slice8; idx += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t e = ((int64_t) rank * slice8 + idx) * 8;
+        float sum[8] = {};
+#pragma unroll
+        for (int r = 0; r < NRANKS; r++) {
+            ar_add8<F16>(sum, r == rank ? ar_pack8<F16>(input + e) : ar_load_nt(own + (int64_t) r * slice8 + idx));
+        }
+        const uint4 p = ar_pack8_regs<F16>(sum);
+#pragma unroll
+        for (int t = 1; t < NRANKS; t++) {
+            ag((rank + t) % NRANKS)[(int64_t) rank * slice8 + idx] = p;
+        }
+        ar_store8<F16>(result + e, p); // the rounded sum, as the peers get it
+    }
+    __threadfence_system();
+    barrier_end<NRANKS>(sg, self_sg, rank);
+    __syncthreads(); // see k_twoshot_f32: only the first NRANKS threads waited on the flags
+
+    const uint4 * own_ag = ag(rank);
+#pragma unroll
+    for (int t = 1; t < NRANKS; t++) {
+        const int src = (rank + t) % NRANKS;
+        for (int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; idx < slice8; idx += (int64_t) gridDim.x * blockDim.x) {
+            ar_store8<F16>(result + ((int64_t) src * slice8 + idx) * 8, ar_load_nt(own_ag + (int64_t) src * slice8 + idx));
+        }
+    }
+}
+
 // ============================================================================
 // Host functions
 // ============================================================================
@@ -835,11 +994,14 @@ bool tp_custom_ar_prepare(CustomARContext * ctx,
     // Broadcast path: F32 staging, N slots per rank (one inbox per peer + unused self slot).
     // Two-shot path: F32 staging, 2 buffers (scatter_buf + allgather_buf) each
     //   sized n_elements floats. Total = 2 * n_elements * sizeof(float) bytes.
+    // Broadcast and two-shot calls alternate within one token (the last layer keeps one row), so the staging
+    // only grows: reallocating on every switch frees device memory, which drains every GPU twice per token.
+    // Broadcast slots stay below the middle, where the two-shot allgather region starts.
     const size_t per_slot   = bytes_f32;
-    const int    need_slots = s_twoshot ? 2 : (s_broadcast ? ctx->nranks : 1);
+    const int    need_slots = s_twoshot ? 2 : (s_broadcast ? 2 * ctx->nranks : 1);
     const size_t need_bytes = per_slot * need_slots;
 
-    if (ctx->staging_slots != need_slots || ctx->staging_size < need_bytes) {
+    if (ctx->staging_size < need_bytes) { // broadcast_ok is fixed at init, so the slot layout never changes kind
         for (int rank = 0; rank < ctx->nranks; rank++) {
             ggml_cuda_set_device(ctx->dev_ids[rank]);
             if (ctx->d_staging[rank]) {
@@ -961,6 +1123,11 @@ bool tp_custom_ar_prepare(CustomARContext * ctx,
     plan->blocks     = blocks;
     plan->twoshot    = s_twoshot;
     plan->broadcast  = s_broadcast;
+    static const int s_wire = []{ // 0 f32, 1 bf16, 2 f16
+        const char * e = getenv("GGML_TP_AR_WIRE");
+        return e == nullptr ? 2 : strcmp(e, "f32") == 0 ? 0 : strcmp(e, "bf16") == 0 ? 1 : 2;
+    }();
+    plan->wire       = s_broadcast && n_elements % (8 * nranks) == 0 ? s_wire : 0;
     // The allgather region starts at half the staging allocation, above the scatter region of every call the allocation can serve.
     plan->ag_offset  = (int64_t) (ctx->staging_size / sizeof(float) / 2) & ~(int64_t) 3;
     GGML_ASSERT(!s_twoshot || plan->ag_offset >= n_elements);
@@ -1001,6 +1168,16 @@ void tp_custom_ar_launch_rank(const CustomARPlan * plan, int rank) {
                 k_cross_device_reduce_1stage<N><<<blocks, kThreads, 0, plan->streams[rank]>>>(
                     ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
                     plan->outputs[rank], rank, n_elements);
+            } else if (plan->wire != 0 && plan->twoshot) {
+                auto k = plan->wire == 2 ? k_twoshot_16<N, true> : k_twoshot_16<N, false>;
+                k<<<blocks, kThreads, 0, plan->streams[rank]>>>(
+                    ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
+                    plan->inputs[rank], plan->outputs[rank], rank, n_elements, plan->ag_offset);
+            } else if (plan->wire != 0) {
+                auto k = plan->wire == 2 ? k_broadcast_reduce_16<N, true> : k_broadcast_reduce_16<N, false>;
+                k<<<blocks, kThreads, 0, plan->streams[rank]>>>(
+                    ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
+                    plan->inputs[rank], plan->outputs[rank], rank, n_elements);
             } else if (plan->twoshot) {
                 k_twoshot_f32<N><<<blocks, kThreads, 0, plan->streams[rank]>>>(
                     ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],

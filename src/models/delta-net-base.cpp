@@ -467,7 +467,10 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
-    qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
+    // contiguous, so the concat below takes the fast path: concat_non_cont runs one block per channel with only
+    // kernel - 1 + n_tokens threads busy and reads the transposed input with a channel stride (37 us per layer at
+    // 6 tokens on gfx906, against ~10 us for the transpose plus concat_cont)
+    qkv_mixed = ggml_cont(ctx0, ggml_transpose(ctx0, qkv_mixed));
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
@@ -501,19 +504,22 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         const int64_t n_written = std::min<int64_t>(K, std::max<int64_t>(1, n_new));
 
         GGML_ASSERT(inp->n_snap == n_written);
-        GGML_ASSERT((int64_t) inp->s_write_slices.size() == n_written);
+        GGML_ASSERT(inp->s_write_conv != nullptr);
 
-        for (int64_t snap = 0; snap < n_written; ++snap) {
-            ggml_tensor * window = ggml_view_3d(ctx0, conv_input,
-                    conv_kernel_size - 1, conv_channels, n_seqs,
-                    conv_input->nb[1], conv_input->nb[2],
-                    ggml_row_size(conv_input->type, n_new - snap));
-            ggml_tensor * rows = ggml_reshape_2d(
-                    ctx0, ggml_cont(ctx0, window), row_count, n_seqs);
+        // All snapshot windows in one copy and one scatter instead of one of each per snapshot. Window w (oldest
+        // first) starts n_written - 1 - w tokens before the newest, so the windows overlap: a 4D view
+        // [kernel - 1, channels, window, seq] with a one-element stride along the window axis. ggml_view_4d sizes
+        // its bounds check as if the view were contiguous, so the window axis is widened after creation; the
+        // strided extent stays inside conv_input. Rows come out seq-major, oldest window first, which is the
+        // order of s_write_conv.
+        ggml_tensor * windows = ggml_view_4d(ctx0, conv_input,
+                conv_kernel_size - 1, conv_channels, 1, n_seqs,
+                conv_input->nb[1], ggml_element_size(conv_input), conv_input->nb[2],
+                ggml_row_size(conv_input->type, n_new - n_written + 1));
+        windows->ne[2] = n_written;
+        ggml_tensor * rows = ggml_reshape_2d(ctx0, ggml_cont(ctx0, windows), row_count, n_written * n_seqs);
 
-            ggml_build_forward_expand(gf,
-                    ggml_set_rows(ctx0, conv_states_all, rows, inp->s_write_slices[snap]));
-        }
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, conv_states_all, rows, inp->s_write_conv));
     } else {
         // [TAG_RECURRENT_ROLLBACK_SPLITS]
         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
@@ -616,8 +622,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     if (inp->s_write != nullptr) {
         GGML_ASSERT(inp->n_snap == n_written);
-        ggml_tensor * rows = ggml_reshape_2d(
-                ctx0, ggml_cont(ctx0, src), D, n_seqs * n_written);
+        // src is already contiguous; the CUDA backend fuses this scatter into the gated_delta_net kernel
+        // (ggml_cuda_try_gdn_cache_fusion), so the snapshots go straight to their ring rows
+        ggml_tensor * rows = ggml_reshape_2d(ctx0, src, D, n_seqs * n_written);
         ggml_build_forward_expand(gf,
                 ggml_set_rows(ctx0, ssm_states_all, rows, inp->s_write));
     } else {

@@ -477,6 +477,9 @@ void ggml_cuda_mul_mat_q(
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
+    if (type == GGML_TYPE_W4A4 || type == GGML_TYPE_W4A4H) {
+        return false; // ruquant: its own path, rq-w4a4.cu
+    }
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS

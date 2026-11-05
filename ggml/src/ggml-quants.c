@@ -5378,6 +5378,387 @@ static bool validate_e_e8m0(uint8_t e, size_t i) {
         } \
     }
 
+
+// ====================== ruquant W4A4 ======================
+
+static bool rq_is_prime(int q) {
+    if (q < 2) return false;
+    for (int d = 2; d * d <= q; ++d) if (q % d == 0) return false;
+    return true;
+}
+
+bool ggml_rq_hadamard_factor(int64_t n, int * p, int * m) {
+    for (int pp = 1; pp <= 128 && pp <= n; ++pp) {
+        if (pp > 1 && (pp % 4 != 0 || !rq_is_prime(pp - 1) || (pp - 1) % 4 != 3)) continue;
+        if (n % pp != 0) continue;
+        const int64_t mm = n / pp;
+        if (mm & (mm - 1)) continue;
+        *p = pp;
+        *m = (int) mm;
+        return true;
+    }
+    return false;
+}
+
+// Paley construction I: A = I + S, S[0][j>0] = 1, S[i>0][0] = -1, S[i][j] = chi(j - i mod q) for i, j >= 1
+static void rq_paley(int p, int8_t * A) {
+    const int q = p - 1;
+    int8_t chi[128];
+    chi[0] = 0;
+    for (int i = 1; i < q; ++i) chi[i] = -1;
+    for (int i = 1; i < q; ++i) chi[(i * i) % q] = 1;
+    for (int i = 0; i < p; ++i) {
+        for (int j = 0; j < p; ++j) {
+            int s;
+            if (i == 0)      s = j == 0 ? 0 : 1;
+            else if (j == 0) s = -1;
+            else             s = chi[((j - i) % q + q) % q];
+            A[i*p + j] = (int8_t) ((i == j ? 1 : 0) + s);
+        }
+    }
+}
+
+void ggml_rq_hadamard(float * GGML_RESTRICT x, int64_t n, bool transpose) {
+    int p, m;
+    GGML_ASSERT(ggml_rq_hadamard_factor(n, &p, &m) && "row length has no ruquant Hadamard");
+    // Sylvester (symmetric) over each chunk of m, butterflies in increasing stride
+    for (int i = 0; i < p; ++i) {
+        float * c = x + (int64_t) i * m;
+        for (int h = 1; h < m; h <<= 1) {
+            for (int j = 0; j < m; j += 2*h) {
+                for (int k = j; k < j + h; ++k) {
+                    const float a = c[k], b = c[k + h];
+                    c[k] = a + b;
+                    c[k + h] = a - b;
+                }
+            }
+        }
+    }
+    // Paley across chunks: y[a] = sum_i x[i] A[i][a] (A[a][i] when transposed), i ascending from 0
+    if (p > 1) {
+        int8_t A[128*128];
+        float col[128];
+        rq_paley(p, A);
+        for (int j = 0; j < m; ++j) {
+            for (int i = 0; i < p; ++i) col[i] = x[(int64_t) i*m + j];
+            for (int a = 0; a < p; ++a) {
+                float acc = 0.0f;
+                for (int i = 0; i < p; ++i) {
+                    const int8_t e = transpose ? A[a*p + i] : A[i*p + a];
+                    acc = e > 0 ? acc + col[i] : acc - col[i];
+                }
+                x[(int64_t) a*m + j] = acc;
+            }
+        }
+    }
+    const float scale = 1.0f / sqrtf((float) n);
+    for (int64_t i = 0; i < n; ++i) x[i] *= scale;
+}
+
+#define RQ_AG_M 255 // activation group multipliers are 1..RQ_AG_M (see rq_quantize_row_a)
+
+static inline void rq_pack(block_w4a4 * GGML_RESTRICT y, const int8_t * GGML_RESTRICT codes, int64_t k, float d, int32_t sum) {
+    for (int64_t b = 0; b < k / QK_W4A4; ++b) {
+        y[b].d = d;
+        y[b].sum = sum;
+        y[b].pad[0] = (int32_t) k;
+        y[b].pad[1] = 0;
+        for (int w = 0; w < QK_W4A4 / 8; ++w) {
+            uint32_t word = 0;
+            for (int j = 0; j < 8; ++j) word |= (uint32_t) (codes[b*QK_W4A4 + 8*w + j] & 0xF) << (4*j);
+            y[b].qs[w] = word;
+        }
+    }
+}
+
+static inline int32_t rq_code(uint32_t word, int j) {
+    return (int32_t) (((word >> (4*j)) & 0xF) << 28) >> 28;
+}
+
+// weights: symmetric codes in [-8, 7], scale = clip * amax / 7 with the clip ratio (1.0 down to 0.7 in
+// 13 steps) that minimizes the squared rounding error of the n values
+static float rq_scale_search(const float * GGML_RESTRICT x, int64_t n) {
+    float amax = 0.0f;
+    for (int64_t i = 0; i < n; ++i) amax = fmaxf(amax, fabsf(x[i]));
+    float best_s = 0.0f;
+    if (amax > 0.0f) {
+        double best_err = INFINITY;
+        for (int r = 0; r < 13; ++r) {
+            const float s = amax * (1.0f - 0.025f * r) / 7.0f;
+            double err = 0.0;
+            for (int64_t i = 0; i < n; ++i) {
+                const float q = fminf(fmaxf(rintf(x[i] / s), -8.0f), 7.0f);
+                const double e = (double) (q * s) - (double) x[i];
+                err += e * e;
+            }
+            if (err < best_err) { best_err = err; best_s = s; }
+        }
+    }
+    return best_s;
+}
+
+// weight groups (RQ_WGROUP=1 or 64, for tests; models get them from ruquant convert --wgroups [64]): a scale per
+// block (or per 64 inputs) from the search, as an integer multiple k (1..15) of the row's unit, the largest / 15
+static int rq_wgroups(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("RQ_WGROUP");
+        on = e ? (atoi(e) == 64 ? 64 : atoi(e) > 0 ? QK_W4A4 : 0) : 0;
+    }
+    return on;
+}
+
+// one scale per row, or with rq_wgroups() one per block
+static void rq_quantize_row_w(const float * GGML_RESTRICT x, block_w4a4 * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % QK_W4A4 == 0);
+    const int64_t nb = k / QK_W4A4;
+    int8_t * codes = (int8_t *) malloc(k);
+    if (!rq_wgroups()) {
+        const float s = rq_scale_search(x, k);
+        int32_t sum = 0;
+        for (int64_t i = 0; i < k; ++i) {
+            codes[i] = s > 0.0f ? (int8_t) fminf(fmaxf(rintf(x[i] / s), -8.0f), 7.0f) : 0;
+            sum += codes[i];
+        }
+        rq_pack(y, codes, k, s, sum);
+        free(codes);
+        return;
+    }
+    const int gs = rq_wgroups(), ng = (int) (k / gs);
+    float * sb = (float *) malloc(ng * sizeof(float));
+    int32_t * kb = (int32_t *) malloc(ng * sizeof(int32_t));
+    float smax = 0.0f;
+    for (int g = 0; g < ng; ++g) {
+        sb[g] = rq_scale_search(x + (int64_t) g*gs, gs);
+        smax = fmaxf(smax, sb[g]);
+    }
+    const float v = smax / 15.0f;
+    for (int g = 0; g < ng; ++g) {
+        kb[g] = v > 0.0f ? (int32_t) fminf(fmaxf(rintf(sb[g] / v), 1.0f), 15.0f) : 1;
+        const float s = (float) kb[g] * v;
+        for (int i = 0; i < gs; ++i) {
+            codes[(int64_t) g*gs + i] = s > 0.0f ? (int8_t) fminf(fmaxf(rintf(x[(int64_t) g*gs + i] / s), -8.0f), 7.0f) : 0;
+        }
+    }
+    rq_pack(y, codes, k, v, 0);
+    for (int64_t b = 0; b < nb; ++b) {
+        y[b].sum = gs == QK_W4A4 ? 1 << 30 | kb[b]
+                                 : 3 << 29 | kb[4*b] | kb[4*b + 1] << 4 | kb[4*b + 2] << 8 | kb[4*b + 3] << 12;
+    }
+    free(kb);
+    free(sb);
+    free(codes);
+}
+
+// activation clip ratio: the range [min(x,0), max(x,0)] is scaled by it before quantizing (outliers
+// saturate). A weight tensor carries its own in its block headers (pad[1], a float; 0 = unset); RQ_ACT_CLIP /
+// RQ_ACT_CLIP_H (W4A4 / W4A4H inputs) override it for experiments; without either it is 1. Every backend
+// resolves it the same way.
+float ggml_rq_act_clip(bool hadamard) {
+    return ggml_rq_act_clip_for(0.0f, hadamard);
+}
+
+float ggml_rq_act_clip_for(float tensor_clip, bool hadamard) {
+    static float env[2] = { -2.0f, -2.0f }; // -1: not set
+    if (env[0] == -2.0f) {
+        const char * e = getenv("RQ_ACT_CLIP");
+        const char * eh = getenv("RQ_ACT_CLIP_H");
+        env[0] = e ? (float) atof(e) : -1.0f;
+        env[1] = eh ? (float) atof(eh) : env[0];
+    }
+    const float e = env[hadamard ? 1 : 0];
+    return e > 0.0f ? e : tensor_clip > 0.0f ? tensor_clip : 1.0f;
+}
+
+float ggml_rq_tensor_clip(const void * blocks) {
+    float c;
+    memcpy(&c, &((const block_w4a4 *) blocks)->pad[1], sizeof(c));
+    return c;
+}
+
+int64_t ggml_rq_tensor_rot(const void * blocks, int64_t k) {
+    return ggml_rq_rot_check(((const block_w4a4 *) blocks)->pad[0], k);
+}
+
+int64_t ggml_rq_rot_check(int32_t n, int64_t k) {
+    int p, m;
+    if (n <= 0 || k % n != 0 || !ggml_rq_hadamard_factor(n, &p, &m)) {
+        // a model whose online Hadamard spans the whole row, split along K (-sm tensor): reconvert with --rot-blocks
+        GGML_ABORT("W4A4H: Hadamard length %d does not divide this row slice of %lld (ruquant convert --rot-blocks)",
+                   (int) n, (long long) k);
+    }
+    return n;
+}
+
+// activation group size: 64, or 128 / 256 with RQ_ACT_GROUP for experiments. Every backend reads it here.
+int ggml_rq_act_group(void) {
+    static int g = 0;
+    if (g == 0) {
+        const char * e = getenv("RQ_ACT_GROUP");
+        const int v = e ? atoi(e) : 64;
+        g = v == 128 || v == 256 ? v : 64;
+    }
+    return g;
+}
+
+// activations: per token, asymmetric, a scale and zero point per group of G = ggml_rq_act_group() values. Group g's
+// range is [min(x,0), max(x,0)] * clip. The token's widest range R sets a unit u = R / (15 * RQ_AG_M); group g's
+// scale is the smallest integer multiple m_g * u (m_g in 1..RQ_AG_M) covering its range. A block (256 values, S =
+// 256 / G groups) stores u in d, the zero points in sum (4 bits per group, log2(S) in bits 16..17), the multipliers
+// in pad[0] (8 bits per group) and the row length in pad[1]; codes are q - 8. The dot product stays an exact
+// integer: sum_g m_g * (acc_g + (8 - z_g) * colsum_g), times u, times s_w.
+static void rq_quantize_row_a(const float * GGML_RESTRICT x, block_w4a4 * GGML_RESTRICT y, int64_t k, float clip) {
+    GGML_ASSERT(k % QK_W4A4 == 0);
+    const int G = ggml_rq_act_group(), lsub = G == 64 ? 2 : G == 128 ? 1 : 0;
+    const int64_t ng = k / G;
+    float * lo = (float *) malloc(ng * 2 * sizeof(float));
+    float * hi = lo + ng;
+    float R = 0.0f;
+    for (int64_t g = 0; g < ng; ++g) {
+        float mn = 0.0f, mx = 0.0f;
+        for (int i = 0; i < G; ++i) { mn = fminf(mn, x[g*G + i]); mx = fmaxf(mx, x[g*G + i]); }
+        lo[g] = mn * clip;
+        hi[g] = mx * clip;
+        R = fmaxf(R, hi[g] - lo[g]);
+    }
+    if (R == 0.0f) R = 2.0f;
+    const float u = R / (15.0f * RQ_AG_M);
+    for (int64_t b = 0; b < k / QK_W4A4; ++b) {
+        y[b].d = u;
+        y[b].sum = lsub << 16;
+        y[b].pad[0] = 0;
+        y[b].pad[1] = (int32_t) k;
+    }
+    for (int64_t g = 0; g < ng; ++g) {
+        const int m = (int) fminf(fmaxf(ceilf(((hi[g] - lo[g]) * (float) RQ_AG_M) / R), 1.0f), (float) RQ_AG_M);
+        const float inv = 1.0f / ((float) m * u);
+        const float zf = fminf(fmaxf(rintf(-lo[g] * inv), 0.0f), 15.0f);
+        block_w4a4 * yb = &y[g*G / QK_W4A4];
+        const int sg = (int) (g % (QK_W4A4 / G));
+        yb->sum |= (int32_t) zf << (4*sg);
+        yb->pad[0] = (int32_t) ((uint32_t) yb->pad[0] | (uint32_t) m << (8*sg));
+        for (int w = sg*G/8; w < (sg + 1)*G/8; ++w) {
+            uint32_t word = 0;
+            for (int j = 0; j < 8; ++j) {
+                const float q = fminf(fmaxf(rintf(x[(g - sg)*G + 8*w + j] * inv) + zf, 0.0f), 15.0f);
+                word |= (uint32_t) (((int) q - 8) & 0xF) << (4*j);
+            }
+            yb->qs[w] = word;
+        }
+    }
+    free(lo);
+}
+
+void quantize_row_w4a4_ref(const float * GGML_RESTRICT x, block_w4a4 * GGML_RESTRICT y, int64_t k) {
+    rq_quantize_row_w(x, y, k);
+}
+
+// Hadamard blocks per W4A4H row (RQ_ROT_BLOCKS, for tests; models get them from ruquant convert --rot-blocks): the
+// online rotation is block-diagonal, k / blocks wide, so a tensor-parallel split of K keeps whole blocks per device
+static int64_t rq_rot_len(int64_t k) {
+    static int blocks = 0;
+    if (blocks == 0) {
+        const char * e = getenv("RQ_ROT_BLOCKS");
+        blocks = e && atoi(e) > 1 ? atoi(e) : 1;
+    }
+    return k % blocks == 0 ? k / blocks : k;
+}
+
+// x <- x diag(H_n, H_n, ...), each H_n as ggml_rq_hadamard
+static void rq_hadamard_blocks(float * GGML_RESTRICT x, int64_t k, int64_t n, bool transpose) {
+    for (int64_t off = 0; off < k; off += n) ggml_rq_hadamard(x + off, n, transpose);
+}
+
+void quantize_row_w4a4h_ref(const float * GGML_RESTRICT x, block_w4a4 * GGML_RESTRICT y, int64_t k) {
+    // stores Q(W H): the activations get x H at run time, and (x H)(W H)^T = x W^T; the Hadamard length is in pad[0]
+    const int64_t n = rq_rot_len(k);
+    float * t = (float *) malloc(k * sizeof(float));
+    memcpy(t, x, k * sizeof(float));
+    rq_hadamard_blocks(t, k, n, false);
+    rq_quantize_row_w(t, y, k);
+    for (int64_t b = 0; b < k / QK_W4A4; ++b) y[b].pad[0] = (int32_t) n;
+    free(t);
+}
+
+void quantize_row_a4_ref(const float * GGML_RESTRICT x, block_w4a4 * GGML_RESTRICT y, int64_t k) {
+    rq_quantize_row_a(x, y, k, ggml_rq_act_clip(false));
+}
+
+void quantize_row_a4h_ref(const float * GGML_RESTRICT x, block_w4a4 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_a4h_clip(x, y, k, ggml_rq_act_clip(true));
+}
+
+void quantize_row_a4_clip(const float * GGML_RESTRICT x, block_w4a4 * GGML_RESTRICT y, int64_t k, float clip) {
+    rq_quantize_row_a(x, y, k, clip);
+}
+
+void quantize_row_a4h_clip(const float * GGML_RESTRICT x, block_w4a4 * GGML_RESTRICT y, int64_t k, float clip) {
+    quantize_row_a4h_clip_n(x, y, k, clip, k);
+}
+
+void quantize_row_a4h_clip_n(const float * GGML_RESTRICT x, block_w4a4 * GGML_RESTRICT y, int64_t k, float clip, int64_t n) {
+    GGML_ASSERT(n > 0 && k % n == 0);
+    float * t = (float *) malloc(k * sizeof(float));
+    memcpy(t, x, k * sizeof(float));
+    rq_hadamard_blocks(t, k, n, false);
+    rq_quantize_row_a(t, y, k, clip);
+    for (int64_t b = 0; b < k / QK_W4A4; ++b) y[b].pad[1] = (int32_t) n;
+    free(t);
+}
+
+void dequantize_row_w4a4(const block_w4a4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    for (int64_t b = 0; b < k / QK_W4A4; ++b)
+        for (int w = 0; w < QK_W4A4 / 8; ++w)
+            for (int j = 0; j < 8; ++j) y[b*QK_W4A4 + 8*w + j] = rq_code(x[b].qs[w], j) * ((float) RQ_W_MULT_G(x[b].sum, w / 8) * x[b].d);
+}
+
+void dequantize_row_a4(const block_w4a4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    for (int64_t b = 0; b < k / QK_W4A4; ++b)
+        for (int w = 0; w < QK_W4A4 / 8; ++w)
+            for (int j = 0; j < 8; ++j) {
+                const int sg = (8*w) >> (8 - ((x[b].sum >> 16) & 3)); // group in the block
+                const int z = (x[b].sum >> (4*sg)) & 0xF, m = (int) (((uint32_t) x[b].pad[0] >> (8*sg)) & 0xFF);
+                y[b*QK_W4A4 + 8*w + j] = (rq_code(x[b].qs[w], j) + 8 - z) * ((float) m * x[b].d);
+            }
+}
+
+// back to the original basis, one row at a time; the row length is in pad[len] (pad[0] for weights, pad[1] for
+// activations)
+static void rq_unrotate(const block_w4a4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k, int len) {
+    for (int64_t off = 0; off < k; ) {
+        const int64_t n = x[off / QK_W4A4].pad[len];
+        GGML_ASSERT(n > 0 && off + n <= k);
+        ggml_rq_hadamard(y + off, n, true);
+        off += n;
+    }
+}
+
+void dequantize_row_w4a4h(const block_w4a4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_w4a4(x, y, k);
+    rq_unrotate(x, y, k, 0);
+}
+
+void dequantize_row_a4h(const block_w4a4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_a4(x, y, k);
+    rq_unrotate(x, y, k, 1);
+}
+
+size_t quantize_w4a4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    const size_t row_size = ggml_row_size(GGML_TYPE_W4A4, n_per_row);
+    for (int64_t r = 0; r < nrows; ++r)
+        quantize_row_w4a4_ref(src + r*n_per_row, (block_w4a4 *) ((char *) dst + r*row_size), n_per_row);
+    return nrows * row_size;
+}
+
+size_t quantize_w4a4h(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    const size_t row_size = ggml_row_size(GGML_TYPE_W4A4H, n_per_row);
+    for (int64_t r = 0; r < nrows; ++r)
+        quantize_row_w4a4h_ref(src + r*n_per_row, (block_w4a4 *) ((char *) dst + r*row_size), n_per_row);
+    return nrows * row_size;
+}
+
 bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbytes) {
     if (type < 0 || type >= GGML_TYPE_COUNT) {
         fprintf(stderr, "%s: invalid type %d\n", __func__, type);
@@ -5524,6 +5905,19 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q5_1:
             {
                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q5_1, data, nb, d, m);
+            } break;
+        case GGML_TYPE_W4A4:
+        case GGML_TYPE_W4A4H:
+        case GGML_TYPE_A4:
+        case GGML_TYPE_A4H:
+            {
+                const block_w4a4 * q = (const block_w4a4 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!isfinite(q[i].d)) {
+                        fprintf(stderr, "%s: invalid scale in block %zu\n", __func__, i);
+                        return false;
+                    }
+                }
             } break;
         case GGML_TYPE_Q8_0:
             {
