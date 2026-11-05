@@ -2697,6 +2697,9 @@ struct ggml_backend_meta_context {
     void * (*tg_capture_end)(ggml_backend_t)        = nullptr;
     void (*tg_graph_launch)(ggml_backend_t, void *) = nullptr;
     void (*tg_graph_free)(ggml_backend_t, void *)   = nullptr;
+    // the sub-backends' scratch-pool free epoch, see tg_entry::epoch
+    uint64_t (*pool_epoch)(void)                    = nullptr;
+    size_t tg_n_captures = 0, tg_n_reuses = 0;
     // One recorded graph set per cgraph shape - a server alternates shapes,
     // and a single-slot cache would reset its warmup on every switch. Only
     // single-stage graphs whose closures are all AllReduce are captured, so
@@ -2712,6 +2715,10 @@ struct ggml_backend_meta_context {
         size_t              uid    = 0;
         int                 warm   = 0;      // tokens seen on this shape
         bool                failed = false;  // capture rejected: never retry
+        uint64_t            sig    = 0;      // tg_signature of the lane graphs
+        // A recording keeps the scratch-pool addresses it was captured with, so it is valid only while no pool has
+        // given memory back to the driver since: the pool epoch at capture.
+        uint64_t            epoch  = 0;
         // Subgraphs [0, covered) are captured in `runs`. Anything at or past
         // `covered` is dispatched per-subgraph after the replay. Only the
         // GGML_META_TG_LIMIT debug knob makes this less than n_subgraphs.
@@ -2741,6 +2748,75 @@ struct ggml_backend_meta_context {
         tg_cache.push_back(tg_entry{});
         tg_cache.back().uid = uid;
         return &tg_cache.back();
+    }
+
+    // What a recording bakes into its launches, per lane and subgraph: each node's op, parameters, shape and device
+    // address, and its sources'. Two graphs with the same signature record the same token.
+    uint64_t tg_signature(size_t uid = 0) const {
+        // GGML_META_TG_DUMP=DIR writes what the signature covers, one line per node, to DIR/sig-UID.txt
+        static const char * dump_dir = getenv("GGML_META_TG_DUMP");
+        FILE * dump = nullptr;
+        if (dump_dir != nullptr) {
+            const std::string path = std::string(dump_dir) + "/sig-" + std::to_string(uid) + ".txt";
+            dump = fopen(path.c_str(), "w");
+        }
+        uint64_t h = 0xcbf29ce484222325ull;
+        auto mix = [&h](uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
+        auto mix_tensor = [&mix](const ggml_tensor * t) {
+            if (t == nullptr) {
+                mix(0);
+                return;
+            }
+            mix((uint64_t) t->op);
+            mix((uint64_t) t->type);
+            mix((uint64_t) t->flags);
+            mix((uint64_t) (uintptr_t) t->data);
+            mix((uint64_t) (uintptr_t) t->extra);
+            for (int k = 0; k < GGML_MAX_DIMS; k++) {
+                mix((uint64_t) t->ne[k]);
+                mix((uint64_t) t->nb[k]);
+            }
+            for (size_t k = 0; k < GGML_MAX_OP_PARAMS / sizeof(int32_t); k++) {
+                mix((uint64_t) (uint32_t) t->op_params[k]);
+            }
+        };
+        mix(n_subgraphs);
+        for (size_t i = 0; i < n_subgraphs; i++) {
+            mix((uint64_t) subgraphs[i].closure);
+            mix(subgraphs[i].stage);
+            const size_t lane_lo = subgraphs[i].stage * tps;
+            for (size_t k = lane_lo; k < lane_lo + tps && k < backend_configs.size(); k++) {
+                const ggml_cgraph * cg = backend_configs[k].cgraphs[i].cgraph_main;
+                mix(cg != nullptr ? (uint64_t) cg->n_nodes : 0);
+                for (int n = 0; cg != nullptr && n < cg->n_nodes; n++) {
+                    mix_tensor(cg->nodes[n]);
+                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                        mix_tensor(cg->nodes[n]->src[j]);
+                    }
+                    if (dump != nullptr) {
+                        const ggml_tensor * t = cg->nodes[n];
+                        uint64_t hp = 0;
+                        for (size_t q = 0; q < GGML_MAX_OP_PARAMS / sizeof(int32_t); q++) {
+                            hp = hp * 1000003u + (uint32_t) t->op_params[q];
+                        }
+                        fprintf(dump, "%zu %zu %d %s %s %lld %lld %lld %lld data=%p ex=%p par=%llx", k, i, n, t->name,
+                                ggml_op_desc(t), (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
+                                (long long) t->ne[3], t->data, t->extra, (unsigned long long) hp);
+                        for (int j = 0; j < GGML_MAX_SRC; j++) {
+                            if (t->src[j] != nullptr) {
+                                fprintf(dump, " s%d=%s:%p:%lldx%lld", j, t->src[j]->name, t->src[j]->data,
+                                        (long long) t->src[j]->ne[0], (long long) t->src[j]->ne[1]);
+                            }
+                        }
+                        fprintf(dump, "\n");
+                    }
+                }
+            }
+        }
+        if (dump != nullptr) {
+            fclose(dump);
+        }
+        return h;
     }
 
     void tg_free_entry(tg_entry & e) {
@@ -2987,6 +3063,8 @@ struct ggml_backend_meta_context {
                     ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_token_graph_free");
                 graph_cache_disable = (void (*)(ggml_backend_t))
                     ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_graph_cache_disable");
+                pool_epoch = (uint64_t (*)(void))
+                    ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_pool_epoch");
                 break;
             }
         }
@@ -5059,6 +5137,31 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         auto * tge = backend_ctx->tg_lookup(cgraph->uid);
 
+        const uint64_t epoch = backend_ctx->pool_epoch != nullptr ? backend_ctx->pool_epoch() : 0;
+        if (!tge->runs.empty() && tge->epoch != epoch) {
+            backend_ctx->tg_free_entry(*tge);
+            tge->warm = 0;
+        }
+        // llama.cpp gives a rebuilt graph a new uid (each request, each KV growth step). One that came out identical
+        // to a recorded graph, the same launches on the same addresses, replays that recording instead of warming up
+        // for tg_warm_needed tokens and capturing again (~14 ms of instantiation per lane on ROCm 7.2.4).
+        if (tge->runs.empty() && tge->warm == 0 && !tge->failed) {
+            tge->sig = backend_ctx->tg_signature(cgraph->uid);
+            for (auto & e : backend_ctx->tg_cache) {
+                if (&e != tge && e.sig == tge->sig && e.epoch == epoch && !e.runs.empty() && !e.failed) {
+                    tge->runs    = std::move(e.runs);
+                    tge->covered = e.covered;
+                    tge->epoch   = e.epoch;
+                    e.runs.clear();
+                    e.warm = 0;
+                    backend_ctx->tg_n_reuses++;
+                    GGML_LOG_INFO("%s: token graph: uid %zu replays an identical recording (%zu captures, %zu reuses)\n",
+                                  __func__, (size_t) cgraph->uid, backend_ctx->tg_n_captures, backend_ctx->tg_n_reuses);
+                    break;
+                }
+            }
+        }
+
         // Replay. Each run is one launch per lane of its stage, then the stage transfer
         // on the host, which is what the next stage's inputs depend on.
         if (!tge->runs.empty()) {
@@ -5252,6 +5355,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
 
                 if (ok) {
+                    tge->epoch = epoch;
+                    backend_ctx->tg_n_captures++;
+                    GGML_LOG_INFO("%s: token graph: uid %zu captured (%zu captures, %zu reuses)\n", __func__,
+                                  (size_t) cgraph->uid, backend_ctx->tg_n_captures, backend_ctx->tg_n_reuses);
                     // Capture records without executing, so this token still runs.
                     for (const auto & r : tge->runs) {
                         const size_t lane_lo = r.stage * backend_ctx->tps;

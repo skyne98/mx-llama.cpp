@@ -457,12 +457,26 @@ llama_context::llama_context(
         // The test is meant to say every layer is on a GPU.
         // Strictly-greater only holds when the user overshoots -ngl, which for a model this size forces a split that does not fit: 41 units over 10 devices leaves one card with five layers and no -ts value avoids it.
         // The auto-fitter does place all n_layer_all layers on GPU and lands exactly on equality, so >= enables the ring in precisely the case the condition was describing.
+        // With whole-token HIP graphs (GGML_META_TOKEN_GRAPH=1), single-stage -sm tensor drops the scheduler's input
+        // ring: its copies rotate with every graph allocation, so a rebuilt graph reads its inputs from whichever copy
+        // is current, and a recording made for one copy can't be replayed for another. Without token graphs the ring
+        // stays: on ROCm 5.7 a TP4 verify ran ~1.9 ms slower on the GPU without it (host times unchanged; not on
+        // 7.2.4). LLAMA_TP_PIPELINE=0/1 overrides.
+        static const int tp_pipeline = [] {
+            const char * e = getenv("LLAMA_TP_PIPELINE");
+            if (e != nullptr) {
+                return atoi(e) != 0 ? 1 : 0;
+            }
+            const char * tg = getenv("GGML_META_TOKEN_GRAPH"); // read as the meta backend does: unset is on
+            return tg == nullptr || atoi(tg) != 0 ? 0 : 1;
+        }();
+        const bool tp_staged = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+            (model.get_split_state_ud.n_stages > 1 || tp_pipeline != 0);
         bool pipeline_parallel =
             model.n_gpu_layers() >= model.hparams.n_layer_all &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides() &&
-            ((model.split_mode() == LLAMA_SPLIT_MODE_LAYER && model.n_devices() > 1) ||
-             model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) &&
+            ((model.split_mode() == LLAMA_SPLIT_MODE_LAYER && model.n_devices() > 1) || tp_staged) &&
             cparams.moe_cache_size == 0; // not supported by the MoE cache
 
         // The MTP draft context replays only a few small (single-layer) decodes at begin(); a deep

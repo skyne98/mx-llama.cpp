@@ -459,6 +459,10 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // #define DEBUG_CUDA_MALLOC
 
+// Bumped whenever a pool gives memory back to the driver. A recorded token graph keeps the scratch addresses it was
+// captured with, so a recording older than the last bump may point at freed memory (ggml_backend_pool_epoch).
+static std::atomic<uint64_t> g_cuda_pool_free_epoch{0};
+
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
@@ -486,6 +490,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
+                g_cuda_pool_free_epoch++;
                 CUDA_CHECK(cudaFree(b.ptr));
                 pool_size -= b.size;
                 b.ptr  = nullptr;
@@ -581,6 +586,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             }
         }
         GGML_LOG_DEBUG(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
+        g_cuda_pool_free_epoch++;
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
@@ -1272,7 +1278,10 @@ static bool ggml_backend_cuda_comm_allreduce_custom_prepare(
     if (s_gate_on && s_have_nccl) {
         // Small-vs-large threshold from upstream's NCCL heuristic. Below this,
         // broadcast wins on TG by 14-30%; above this, NCCL BF16 ring is faster.
-        eligible = (n_backends <= 2 && ne < 32768) ||
+        // Two ranks take up to 131072 values (upstream: 32768), so a speculative
+        // verify of up to 25 tokens x 5120 stays on the custom kernel, which a
+        // whole-token HIP graph can record; RCCL can't be captured.
+        eligible = (n_backends <= 2 && ne < 131072) ||
                    (n_backends == 3 && ne < 131072) ||
                    (n_backends >= 4 && ne < 262144);
     }
@@ -8059,6 +8068,10 @@ static void ggml_backend_cuda_token_graph_launch(ggml_backend_t backend, void * 
     CUDA_CHECK(cudaGraphLaunch((cudaGraphExec_t) exec, cuda_ctx->stream()));
 }
 
+static uint64_t ggml_backend_cuda_pool_epoch(void) {
+    return g_cuda_pool_free_epoch.load();
+}
+
 static void ggml_backend_cuda_token_graph_free(ggml_backend_t backend, void * exec) {
     GGML_UNUSED(backend);
     if (exec != nullptr) {
@@ -8097,6 +8110,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_token_graph_free") == 0) {
         return (void *)ggml_backend_cuda_token_graph_free;
+    }
+    if (strcmp(name, "ggml_backend_pool_epoch") == 0) {
+        return (void *)ggml_backend_cuda_pool_epoch;
     }
     if (strcmp(name, "ggml_backend_comm_set_pipeline_stages") == 0) {
         return (void *) ggml_backend_cuda_comm_set_pipeline_stages;
