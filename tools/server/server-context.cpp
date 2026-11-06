@@ -944,6 +944,77 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
 // server_context_impl (private implementation)
 //
 
+// ruquant: the model's own tokens for text a client sends back unchanged. A model can sample a valid but
+// non-canonical tokenization (a word as two tokens where the tokenizer makes one); the client returns the same text,
+// the server tokenizes it canonically, and the token match with the cache ends there. With recurrent layers (Qwen3.5's
+// DeltaNet) the state cannot be rewound, so the server re-processed everything after that point: 16k tokens after a
+// long answer, measured with opencode. Where the cached tokens and the new prompt spell the same bytes up to a common
+// token boundary (within 64 tokens of a mismatch), the new prompt takes the cached tokens for that span; a real
+// change of the text stops the walk. Prompts with media are left alone. LLAMA_TEXT_MATCH=0 turns it off.
+static bool rq_adopt_cached_tokens(const llama_context * ctx, const server_tokens & cached, server_tokens & incoming) {
+    const llama_tokens & a = cached.get_tokens();
+    const llama_tokens & b = incoming.get_tokens();
+    for (const llama_token t : a) {
+        if (t == LLAMA_TOKEN_NULL) {
+            return false;
+        }
+    }
+    for (const llama_token t : b) {
+        if (t == LLAMA_TOKEN_NULL) {
+            return false;
+        }
+    }
+    auto piece = [&](llama_token t) { return common_token_to_piece(ctx, t, true); };
+    llama_tokens out;
+    size_t i = 0, j = 0;
+    bool changed = false;
+    while (true) {
+        while (i < a.size() && j < b.size() && a[i] == b[j]) {
+            out.push_back(b[j]);
+            i++;
+            j++;
+        }
+        if (i >= a.size() || j >= b.size()) {
+            break;
+        }
+        // the shorter text takes the next token until both end at the same byte with the same bytes
+        std::string ta, tb;
+        size_t ii = i, jj = j;
+        bool aligned = false;
+        while (ii - i < 64 && jj - j < 64) {
+            if ((ta.size() <= tb.size() && ii < a.size()) || jj >= b.size()) {
+                if (ii >= a.size()) {
+                    break;
+                }
+                ta += piece(a[ii++]);
+            } else {
+                tb += piece(b[jj++]);
+            }
+            const size_t m = std::min(ta.size(), tb.size());
+            if (ta.compare(0, m, tb, 0, m) != 0) {
+                break;
+            }
+            if (ta.size() == tb.size()) {
+                aligned = true;
+                break;
+            }
+        }
+        if (!aligned) {
+            break;
+        }
+        out.insert(out.end(), a.begin() + i, a.begin() + ii);
+        i = ii;
+        j = jj;
+        changed = true;
+    }
+    if (!changed) {
+        return false;
+    }
+    out.insert(out.end(), b.begin() + j, b.end());
+    incoming = server_tokens(out, incoming.has_mtmd);
+    return true;
+}
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -2552,6 +2623,37 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
+    // ruquant: a context checkpoint every LLAMA_GEN_CKPT_STEP generated tokens (default 4096, 0 = off). A client that
+    // sends a long answer back changed then rolls back to the last of these instead of to the start of the answer: with
+    // recurrent layers (Qwen3.5's DeltaNet) the state cannot be rewound, so the server re-processed the whole answer
+    // (one character changed at 85% of an 11.7k-token answer, TP2 on MI50s: 11754 tokens in 18.8 s, with checkpoints
+    // every 2048: 1499 in 3.1 s). Text the client returns unchanged in another tokenization is handled by
+    // rq_adopt_cached_tokens. Cost at 2048: none on a 3090, 0.3% of decode at TP2, 0.75% at TP4 (the state is gathered
+    // from every GPU). Taken before the step's draft, when the target holds exactly the slot's tokens; the usual
+    // eviction (n_ctx_checkpoints, checkpoint_min_step) thins them out once the task is done.
+    void maybe_create_gen_checkpoint(server_slot & slot) {
+        static const int64_t step = getenv("LLAMA_GEN_CKPT_STEP") ? atoll(getenv("LLAMA_GEN_CKPT_STEP")) : 4096;
+        if (step <= 0 || params_base.n_ctx_checkpoints <= 0 || !prompt_checkpoint_storage_lossless || !slot.task ||
+            slot.task->type != SERVER_TASK_TYPE_COMPLETION || !slot.spec_draft.empty()) {
+            return;
+        }
+        const int64_t n_cur = slot.prompt.n_tokens();
+        const int64_t last  = slot.prompt.checkpoints.empty() ? 0 : slot.prompt.checkpoints.back().n_tokens;
+        if (n_cur < last + step) {
+            return;
+        }
+        // not with images in the prompt: prompt checkpoints skip media chunks too (positions are not token counts)
+        if (slot.prompt.tokens.find_next_media_chunk(0).first != nullptr || slot.prompt.tokens[0] == LLAMA_TOKEN_NULL) {
+            return;
+        }
+        const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_min < 0) {
+            return;
+        }
+        create_checkpoint(slot, 0, pos_min, pos_max);
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         if (!prompt_checkpoint_storage_lossless) {
             return;
@@ -3431,6 +3533,7 @@ private:
             }
 
             generating.push_back(&slot);
+            maybe_create_gen_checkpoint(slot);
 
             if (spec) {
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
@@ -3583,6 +3686,16 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    // once per task, on the main loop that owns the slot, before anything reads the prompt's length
+                    static const bool text_match = !getenv("LLAMA_TEXT_MATCH") || atoi(getenv("LLAMA_TEXT_MATCH")) != 0;
+                    if (text_match && slot.state == SLOT_STATE_STARTED && slot.task->params.cache_prompt &&
+                        slot.task->n_tokens_shared == 0 && !slot.prompt.tokens.empty()) {
+                        const size_t n_before = slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+                        if (rq_adopt_cached_tokens(ctx_tgt, slot.prompt.tokens, const_cast<server_tokens &>(slot.task->tokens))) {
+                            SLT_INF(slot, "prompt repeats cached text in another tokenization: cache match %zu -> %zu tokens\n",
+                                    n_before, slot.prompt.tokens.get_common_prefix(slot.task->tokens));
+                        }
+                    }
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
