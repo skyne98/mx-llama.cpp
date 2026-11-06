@@ -4,6 +4,7 @@
 #endif
 #include "rq-w4a4-skinny.cuh"
 #include "rq-w4a4-gemm.cuh"
+#include "rq-w4a4-tc.cuh"
 
 #include <atomic>
 #include <map>
@@ -17,8 +18,8 @@ extern "C" int64_t ggml_rq_rot_check(int32_t n, int64_t k);              // ggml
 
 // ruquant W4A4 on CUDA and HIP. Numerics follow the CPU reference in ggml-quants.c op for op (explicit _rn
 // intrinsics, same Hadamard summation order, exact integer accumulation over the activation groups), so CPU and GPU
-// give identical outputs. The GEMM is the skinny kernel (rq-w4a4-skinny.cuh) at verify widths and the tiled one
-// (rq-w4a4-gemm.cuh) at prefill widths.
+// give identical outputs. On NVIDIA GPUs with INT4 tensor cores the GEMM is rq-w4a4-tc.cuh at every width; elsewhere
+// the skinny kernel (rq-w4a4-skinny.cuh) at verify widths and the tiled one (rq-w4a4-gemm.cuh) at prefill widths.
 
 // same factorization as ggml_rq_hadamard_factor (ggml-quants.c)
 static bool rq_factor(int64_t n, int & p, int & m) {
@@ -412,7 +413,22 @@ struct rq_tensor_info {
     float   clip; // block 0 header pad[1]; 0 = unset
     int32_t rot;  // block 0 header pad[0]: W4A4H's Hadamard length (the row, or a block of it)
     bool    wg64; // weight multipliers per 64 inputs (block 0 header sum, RQ_W_MULT_G): activation groups of 64 only
+    bool    tc;   // repacked for the INT4 tensor cores (rq-w4a4-tc.cuh) instead of the skinny layout
 };
+
+// INT4 tensor cores: NVIDIA Turing, Ampere and Ada, activation groups of 64 (one MMA per group); env RQ_TC=0 keeps the
+// dot8-shaped kernels (emulated dot8 on CUDA)
+static bool rq_tc_ok(const ggml_tensor * src0) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(src0);
+    return false;
+#else
+    static const bool env_on = !getenv("RQ_TC") || atoi(getenv("RQ_TC")) != 0;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    GGML_UNUSED(src0); // N is a multiple of RQ_WAVE (ggml_cuda_rq_w4a4_supported), so of the 16-channel tile
+    return env_on && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= RQ_TC_MIN_CC && cc < RQ_TC_MAX_CC && ggml_rq_act_group() == 64;
+#endif
+}
 
 static __global__ void rq_repack_kernel(const uint8_t * __restrict__ src, int32_t * __restrict__ wt, float * __restrict__ sw,
                                         int N, int K) {
@@ -644,7 +660,7 @@ static rq_tensor_info * rq_info(const ggml_tensor * src0, cudaStream_t stream) {
         const int32_t rot = src0->type == GGML_TYPE_W4A4H ? (int32_t) ggml_rq_rot_check(hdr[1], src0->ne[0]) : 0;
         const bool wg64 = ((uint32_t) hdr[0] >> 29) == 3u;
         GGML_ASSERT(!wg64 || ggml_rq_act_group() == 64); // the fold takes one weight multiplier per activation group
-        info = new rq_tensor_info{ false, tclip, rot, wg64 };
+        info = new rq_tensor_info{ false, tclip, rot, wg64, rq_tc_ok(src0) };
         const_cast<ggml_tensor *>(src0)->extra = info;
     }
     return info;
@@ -662,6 +678,15 @@ static void rq_repack_once(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     ggml_cuda_pool_alloc<uint8_t> tmp(ctx.pool(), nbytes);
     CUDA_CHECK(cudaMemcpyAsync(tmp.get(), base, nbytes, cudaMemcpyDeviceToDevice, ctx.stream()));
     const int64_t n_threads = N * Kw;
+    if (info->tc) { // [codes in fragment order | s_w | ck]
+        rq_tc_repack_kernel<<<(n_threads + 255) / 256, 256, 0, ctx.stream()>>>(tmp.get(), (int32_t *) base, (float *) (base + N * K / 2),
+                                                                             (int) N, (int) K);
+        const int64_t n_ck = (N / 16) * (K / 64) * 8;
+        rq_tc_ck_kernel<<<(n_ck + 255) / 256, 256, 0, ctx.stream()>>>(tmp.get(), (uint32_t *) (base + N * K / 2 + N * 4), (int) N, (int) K);
+        CUDA_CHECK(cudaGetLastError());
+        info->repacked = true;
+        return;
+    }
     rq_repack_kernel<<<(n_threads + 255) / 256, 256, 0, ctx.stream()>>>(tmp.get(), (int32_t *) base, (float *) (base + N * K / 2),
                                                                       (int) N, (int) K);
     const int G = ggml_rq_act_group();
@@ -704,6 +729,72 @@ struct rq_host_mark {
     }
 };
 
+// INT4 tensor-core path (rq-w4a4-tc.cuh): quantize the M x K activation (already rotated for W4A4H) once, token-major,
+// then one launch per weight. Up to 64 tokens a warp holds one channel tile and every token (decode, verify); wider, a
+// block of 8 warps holds 128 channels x 64 tokens. K is split while the grid has fewer warps than the GPU can hold.
+template <int MT, int NT, int WN, int WT>
+static void rq_tc_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * const * src0s, ggml_tensor * const * dsts, int n,
+                         const float * x, int ldx, int64_t K, int64_t M, float clip) {
+    cudaStream_t stream = ctx.stream();
+    constexpr int BT = 8 * NT * WT, BN = 16 * MT * WN;
+    const int64_t Mp = (M + BT - 1) / BT * BT;
+    const int Kw = (int) (K / 8), ng = (int) (K / 64);
+    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    std::vector<int> gz(n), nz(n);
+    size_t n_acc = 0, n_cnt = 0;
+    for (int i = 0; i < n; ++i) {
+        const int64_t blocks = (src0s[i]->ne[1] + BN - 1) / BN * (Mp / BT);
+        // split K until the grid could fill every SM with warps (48 on Ampere), keeping 4+ groups per split (one token,
+        // 17408 x 5120 on the 3090: 67-72 us for 1 to 8 splits; 512 tokens: splits only cost)
+        static const int env_split = getenv("RQ_TC_SPLIT") ? atoi(getenv("RQ_TC_SPLIT")) : 0;
+        int s = 1;
+        while (env_split == 0 && blocks * s * WN * WT < 48 * nsm && ng / (2 * s) >= 4) s *= 2;
+        if (env_split > 0) s = env_split;
+        gz[i] = (ng + s - 1) / s;
+        nz[i] = (ng + gz[i] - 1) / gz[i];
+        if (nz[i] > 1) {
+            n_acc += Mp * src0s[i]->ne[1];
+            n_cnt += blocks;
+        }
+    }
+    const int G = ggml_rq_act_group();
+    ggml_cuda_pool_alloc<int32_t> aq(ctx.pool(), Mp * Kw);
+    ggml_cuda_pool_alloc<float>   sa(ctx.pool(), Mp);
+    ggml_cuda_pool_alloc<int32_t> mul(ctx.pool(), Mp * (K / G));
+    ggml_cuda_pool_alloc<int32_t> acc(ctx.pool(), std::max<size_t>(n_acc + n_cnt, 1)); // split-K sums, then counters
+    const int zero_blocks = (int) ((n_acc + n_cnt + RQ_QUANT_THREADS * 16 - 1) / (RQ_QUANT_THREADS * 16));
+    rq_quantize_act_kernel<<<M + zero_blocks, RQ_QUANT_THREADS, 0, stream>>>(x, ldx, (int) K, G, clip, aq.get(), sa.get(), mul.get(),
+                                                                            (int) Mp, 0, acc.get(), (int64_t) (n_acc + n_cnt), (int) M);
+    int32_t * acc_i = acc.get(), * cnt_i = acc.get() + n_acc;
+    for (int i = 0; i < n; ++i) {
+        const int64_t Ni = src0s[i]->ne[1];
+        const uint8_t * base = (const uint8_t *) src0s[i]->data;
+        const dim3 grid((Ni + BN - 1) / BN, Mp / BT, nz[i]);
+        rq_tc_kernel<MT, NT, WN, WT><<<grid, 32 * WN * WT, 0, stream>>>(
+            aq.get(), mul.get(), sa.get(), (const int4 *) base, (const float *) (base + Ni * K / 2),
+            (const uint32_t *) (base + Ni * K / 2 + Ni * 4), (float *) dsts[i]->data, (int) (dsts[i]->nb[1] / sizeof(float)),
+            (int) Ni, (int) M, (int) Mp, Kw, gz[i], acc_i, cnt_i);
+        if (nz[i] > 1) {
+            acc_i += Mp * Ni;
+            cnt_i += grid.x * grid.y;
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void rq_mul_mat_tc(ggml_backend_cuda_context & ctx, const ggml_tensor * const * src0s, ggml_tensor * const * dsts, int n,
+                          const float * x, int ldx, int64_t K, int64_t M, float clip) {
+    for (int i = 0; i < n; ++i) {
+        rq_repack_once(ctx, src0s[i], rq_info(src0s[i], ctx.stream()));
+    }
+    if      (M <= 8)  rq_tc_launch<1, 1, 4, 1>(ctx, src0s, dsts, n, x, ldx, K, M, clip);
+    else if (M <= 16) rq_tc_launch<1, 2, 4, 1>(ctx, src0s, dsts, n, x, ldx, K, M, clip);
+    else if (M <= 24) rq_tc_launch<1, 3, 4, 1>(ctx, src0s, dsts, n, x, ldx, K, M, clip);
+    else if (M <= 32) rq_tc_launch<1, 4, 4, 1>(ctx, src0s, dsts, n, x, ldx, K, M, clip);
+    else if (M <= 64) rq_tc_launch<1, 8, 4, 1>(ctx, src0s, dsts, n, x, ldx, K, M, clip);
+    else              rq_tc_launch<2, 4, 4, 2>(ctx, src0s, dsts, n, x, ldx, K, M, clip);
+}
+
 // dsts[i] = src0s[i] x src1 for n <= 3 weights of one type, K and clip (see ggml_cuda_rq_w4a4_can_fuse): one
 // activation transform and quantization, and on the skinny path one launch for all of them.
 static void rq_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * const * src0s, ggml_tensor * const * dsts, int n,
@@ -728,7 +819,8 @@ static void rq_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * cons
     static const int chunk = getenv("RQ_CHUNK") ? rq_skinny_tp(atoi(getenv("RQ_CHUNK"))) : 24;
     rq_act_cache * cache = nullptr; // set for one-chunk skinny calls, which share their quantized activation
     bool hit = false;
-    if (rq_use_skinny(src0) && M <= chunk && K / 8 <= RQ_CACHE_KW) {
+    const bool tc = info->tc;
+    if (!tc && rq_use_skinny(src0) && M <= chunk && K / 8 <= RQ_CACHE_KW) {
         cache = &rq_cache_for(ctx);
         hit = cache->entry_gen == cache->gen && cache->src1 == src1 && cache->data == src1->data &&
               cache->type == src0->type && cache->clip == clip && cache->rot == n_rot && cache->K == K && cache->M == M;
@@ -793,6 +885,11 @@ static void rq_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * cons
     }
 
     mark(rq_host_prof::HADAMARD);
+    if (tc) {
+        rq_mul_mat_tc(ctx, src0s, dsts, n, x, ldx, K, M, clip);
+        return;
+    }
+
     if (rq_use_skinny(src0)) {
         const int Kw = (int) (K / 8);
         for (int i = 0; i < n; ++i) {
