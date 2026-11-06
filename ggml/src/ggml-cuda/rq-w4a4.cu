@@ -459,9 +459,11 @@ static int rq_skinny_tp(int64_t m) {
     return 64;
 }
 
-// launch shape of the skinny kernel for Tp tokens: R channel groups per wave, W waves, G split-K workgroups
+// launch shape of the skinny kernel for Tp tokens: R channel groups per wave, W waves, G split-K workgroups; sk: the
+// stream-K kernel instead (G and kw_split unused)
 struct rq_skinny_shape {
     int R, KA, W, G, kw_split, groups;
+    bool sk;
 };
 
 // N_launch: the channels of the whole launch (more than N when several weights share it, see rq_jobs). K is split
@@ -516,13 +518,34 @@ static rq_skinny_shape rq_skinny_plan(int tp, int N, int Kw, int N_launch, int g
     }
     const int groups_per_wg = (ngroups + G - 1) / G;
     G = (ngroups + groups_per_wg - 1) / groups_per_wg;
-    return { R, KA, W, G, groups_per_wg * gsteps * RQ_KW, groups };
+    // stream-K (rq_skinny_sk_kernel), env RQ_SKINNY_SK=1
+    static const bool sk = getenv("RQ_SKINNY_SK") != nullptr && atoi(getenv("RQ_SKINNY_SK")) != 0;
+    return { R, KA, W, G, groups_per_wg * gsteps * RQ_KW, groups, sk };
 }
 
 template <int T, int R>
 static void rq_skinny_launch(const rq_skinny_shape & sh, const int32_t * ac, const rq_jobs & jobs, int Kw, cudaStream_t stream) {
     int nblk = 0;
     for (int i = 0; i < jobs.n; ++i) nblk += jobs.j[i].nblk;
+    if (sh.sk) {
+        // the grid: whole rounds of resident workgroups (from the kernel's occupancy), enough that a share is at most
+        // one tile's K. Env RQ_SKINNY_SK_SLOTS overrides the workgroups per round.
+        static int slots[9] = {};
+        int & sl = slots[sh.W];
+        if (sl == 0) {
+            int per_cu = 0;
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, rq_skinny_sk_kernel<T, R>, RQ_WAVE * sh.W,
+                                                                     rq_sk_lds_bytes<T, R>()));
+            sl = std::max(1, per_cu) * ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+            if (getenv("RQ_SKINNY_SK_SLOTS")) {
+                sl = std::max(1, atoi(getenv("RQ_SKINNY_SK_SLOTS")));
+            }
+        }
+        const int nwg = (nblk + sl - 1) / sl * sl;
+        const int ngroups = (Kw / RQ_KW) >> jobs.gsh;
+        rq_skinny_sk_kernel<T, R><<<nwg, RQ_WAVE * sh.W, rq_sk_lds_bytes<T, R>(), stream>>>(ac, jobs, Kw, ngroups);
+        return;
+    }
     rq_skinny_kernel<T, R><<<dim3(nblk, sh.G), RQ_WAVE * sh.W, rq_lds_bytes<T, R>(sh.W), stream>>>(ac, jobs, Kw, sh.kw_split);
 }
 
@@ -861,6 +884,11 @@ static void rq_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * cons
             rq_jobs jobs = {};
             jobs.n = n;
             jobs.gsh = G == 64 ? 1 : G == 128 ? 2 : 3;
+            // each wave starts its K slice (group * 7) mod its groups in: aligned slices put the waves' weight streams on the
+            // same DRAM channels (MI50, T = 8 forward: one GPU 40.4 -> 39.2 ms, TP2 30.2 -> 29.6, TP4 unchanged; some
+            // multipliers, 5 among them, are worse on some shapes). Env RQ_SKINNY_ROT (0 = in order).
+            static const int rot = getenv("RQ_SKINNY_ROT") ? atoi(getenv("RQ_SKINNY_ROT")) : 7;
+            jobs.rot = rot;
             int64_t off = 0;
             for (int i = 0; i < n; ++i) {
                 const int64_t Ni = src0s[i]->ne[1];
@@ -878,7 +906,7 @@ static void rq_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * cons
                 jobs.j[i] = jobs.j[0];
                 jobs.j[i].nblk = 0;
             }
-            const int64_t n_zero = sh.G > 1 ? off : 0;
+            const int64_t n_zero = sh.G > 1 || sh.sk ? off : 0;
             const int zero_blocks = (int) ((n_zero + RQ_QUANT_THREADS * 16 - 1) / (RQ_QUANT_THREADS * 16));
             mark(rq_host_prof::PLAN);
             if (fuse_h) {

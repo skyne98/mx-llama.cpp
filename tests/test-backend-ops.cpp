@@ -10698,6 +10698,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 192, 8, 5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, 8, 5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 5120, 8, 17408, {1, 1}, {1, 1}));
+        // the 27B's shapes per GPU at TP = 4 (RQ_SKINNY_SK=1: stream-K shares that cross tiles)
+        for (int64_t n : {1, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8704, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 5120, n, 4352, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 5120, n, 1536, {1, 1}, {1, 1}));
+        }
     }
 
     for (ggml_type type_a : all_types) {
@@ -12003,6 +12010,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // ruquant W4A4 at the 27B's verify width (8 tokens): its matmuls on one GPU and per GPU at TP = 4 (rows {N, K}; the
+    // FFN down and attention output weights are W4A4H, the rest W4A4)
+    for (int64_t n : {8}) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ {16384, 5120}, {34816, 5120}, {14336, 5120}, {4096, 5120},
+                                                                     {8704, 5120}, {3584, 5120} }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W4A4, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ {5120, 17408}, {5120, 6144}, {5120, 4352}, {5120, 1536} }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W4A4H, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
