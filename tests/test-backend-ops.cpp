@@ -8508,6 +8508,15 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// the ruquant q4_0 attention at the 27B's shapes (rq-fattn.cu): it quantizes Q to int4 by default, and against the CPU,
+// which takes Q as q8_0, its output is 4-5.5e-4 NMSE
+struct test_flash_attn_ext_rq_q4 : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+    double max_nmse_err() override {
+        return 1e-3;
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -10698,6 +10707,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 192, 8, 5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, 8, 5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 5120, 8, 17408, {1, 1}, {1, 1}));
+        // ruquant q4_0 KV attention (rq-fattn.cu, RQ_FA_DOT8 1 / 2 on gfx906): head size 256, 6 query heads per KV head,
+        // decode and verify widths
+        if (type_a == GGML_TYPE_W4A4) {
+            for (int64_t nb : {1, 2, 8, 16}) {
+                for (int64_t kv : {256, 4096}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_rq_q4(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                                          GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+                }
+            }
+        }
         // the 27B's shapes per GPU at TP = 4 (RQ_SKINNY_SK=1: stream-K shares that cross tiles)
         for (int64_t n : {1, 8, 16}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 5120, {1, 1}, {1, 1}));

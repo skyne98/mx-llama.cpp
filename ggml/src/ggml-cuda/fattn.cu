@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "rq-fattn.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -734,7 +735,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     bool need_f16_K = false;
     bool need_f16_V = false;
 
-    switch (kernel) {
+    // the ruquant q4_0 kernel reads the cache as it is
+    switch (ggml_cuda_rq_fattn_q4_applies(dst) ? BEST_FATTN_KERNEL_NONE : kernel) {
         case BEST_FATTN_KERNEL_TILE:
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
@@ -757,6 +759,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (ggml_cuda_rq_fattn_q4_applies(dst)) {
+        ggml_cuda_rq_fattn_q4(ctx, dst);
+        return;
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
