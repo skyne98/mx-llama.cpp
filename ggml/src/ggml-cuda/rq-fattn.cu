@@ -7,11 +7,12 @@
 //   - Q is quantized per 32 values to int4 (RQ_FA_DOT8=1), or to int8 as two int4 planes, 16 * hi + lo
 //     (RQ_FA_DOT8=2, two v_dot8 per 8 products), in q4_0's nibble order. A q4_0 nibble q is q - 8 as a signed int4
 //     after flipping its top bit, so a K dword feeds v_dot8 after one xor.
-//   - The KV sequence is split over the grid; each workgroup (4 waves) streams 64-token tiles of K and V through LDS.
-//     Q.K: lanes are tokens, each wave a quarter of the query rows (the query heads sharing this KV head times the
-//     tokens), Q from scalar loads; online softmax per row with wave reductions, P to LDS as f16.
-//     P.V: lanes are the 256 output channels; each lane decodes its channel of V for 8 tokens once and uses it for
-//     every row (v_dot2 with f32 accumulation).
+//   - The KV sequence is split over as many workgroups as fit the GPU at once; each workgroup (8 or 16 waves, 4 per
+//     SIMD) streams 64-token tiles of K and V through LDS.
+//     Q.K: lanes are tokens, each wave a contiguous share of the query rows (the query heads sharing this KV head times
+//     the tokens), Q from scalar loads; online softmax per row with lazy rescaling, P to LDS as f16.
+//     P.V: pairs of waves cover the 256 output channels, two per lane (the two nibbles of a byte); each lane decodes its
+//     channels of V for 8 tokens once and uses them for every row of its pair (v_dot2 with f32 accumulation).
 //   - Partial results go through llama.cpp's flash_attn_combine_results.
 // On NVIDIA GPUs with INT4 tensor cores (the #else branch) the same numerics run on mma.sync: m16n8k32 .s4 per q4_0
 // block for Q.K, f16 m16n8k16 for P.V.
@@ -27,6 +28,7 @@
 #define RQ_FA_D    256
 #define RQ_FA_TILE 64
 #define RQ_FA_ROWW 37 // LDS words per token row of K / V: 36 (8 q4_0 blocks of 18 bytes) + 1 against bank conflicts
+#define RQ_FA_LAZY 8.0f // a row's reference max moves when a score passes it by more than this: P <= e^8 = 2981 in f16
 
 typedef _Float16 rq_fa_h2 __attribute__((ext_vector_type(2)));
 
@@ -48,11 +50,9 @@ static __device__ __forceinline__ float rq_fa_dot2(rq_fa_h2 a, rq_fa_h2 b, float
 #endif
 }
 
-// the 4 bytes at byte offset o of a word array (o need not be aligned)
+// the 4 bytes at byte offset o of a word array (o need not be aligned; one v_alignbyte for any o)
 static __device__ __forceinline__ int rq_fa_bytes(const int * w, int o) {
-    const int i = o >> 2, s = o & 3;
-    const unsigned lo = w[i], hi = w[i + 1];
-    return s == 0 ? (int) lo : (int) ((lo >> (8 * s)) | (hi << (32 - 8 * s)));
+    return (int) __builtin_amdgcn_alignbyte((unsigned) w[(o >> 2) + 1], (unsigned) w[o >> 2], (unsigned) o & 3);
 }
 
 // reductions over the wave without LDS: DPP within each row of 16 lanes, then the four rows' lane 0 through
@@ -81,13 +81,26 @@ static __device__ __forceinline__ float rq_fa_half(const int * w, int o) { // f1
 
 // Q rows to int4 nibbles in q4_0 order: word j of block b holds elements 4j..4j+3 in its even nibbles and
 // 4j+16..4j+19 in its odd ones. Row r of KV head g is query head g * gqa + r / ncols, query token r % ncols; one wave
-// per row, 4 values per lane. Qq [row][QB][32], Qd [row][8] (the scale times the softmax scale).
+// per row, 4 values per lane. Block-major, so that a wave of the attention kernel finds its rows' words for one block
+// side by side (two scalar loads per block): Qq [g][block][rmax][QB][4], Qd [g][block][rmax] (the scale times the
+// softmax scale), zero past R rows.
 template <int QB>
 static __global__ void __launch_bounds__(64) rq_fa_quant_q(const char * __restrict__ Q, size_t nb1, size_t nb2, int ncols, int gqa,
-                                                           float scale, int * __restrict__ Qq, float * __restrict__ Qd) {
-    const int h = blockIdx.x / ncols, j = blockIdx.x % ncols;
-    const int R = gqa * ncols, row = (h / gqa) * R + (h % gqa) * ncols + j;
+                                                           int rmax, float scale, int * __restrict__ Qq, float * __restrict__ Qd) {
+    const int g = blockIdx.x / rmax, r = blockIdx.x % rmax;
     const int lane = threadIdx.x;
+    const int b = lane >> 3, jw = lane & 3;
+    int   * qq = Qq + (((size_t) g * 8 + b) * rmax + r) * QB * 4 + jw;
+    float * qd = Qd + ((size_t) g * 8 + b) * rmax + r;
+    if (r >= gqa * ncols) {
+        if ((lane & 7) < 4) {
+#pragma unroll
+            for (int p = 0; p < QB; ++p) qq[4 * p] = 0;
+        }
+        if ((lane & 7) == 0) *qd = 0.0f;
+        return;
+    }
+    const int h = g * gqa + r / ncols, j = r % ncols;
     const float * x = (const float *) (Q + (size_t) j * nb1 + (size_t) h * nb2) + 4 * lane;
     const float4 v = *(const float4 *) x;
     const float xs[4] = { v.x, v.y, v.z, v.w };
@@ -118,102 +131,159 @@ static __global__ void __launch_bounds__(64) rq_fa_quant_q(const char * __restri
             w[QB - 1] |= (unsigned) (lo & 15) << sh;
         }
     }
-    const int b = lane >> 3, jw = lane & 3;
 #pragma unroll
     for (int p = 0; p < QB; ++p) {
         const unsigned both = w[p] | __shfl_xor(w[p], 4, 64);
-        if ((lane & 7) < 4) Qq[((size_t) row * QB + p) * 32 + b * 4 + jw] = (int) both;
+        if ((lane & 7) < 4) qq[4 * p] = (int) both;
     }
-    if ((lane & 7) == 0) Qd[(size_t) row * 8 + b] = d * scale;
+    if ((lane & 7) == 0) *qd = d * scale;
 }
 
-// grid (chunks, KV heads), 256 threads. R = gqa * ncols query rows per KV head, at most RMAX.
-template <int RMAX, int QB>
-static __global__ void __launch_bounds__(256) rq_fa_q4_kernel(
+// two tokens' values of V for channels j and j + 16 of a q4_0 block (the low and high nibble of byte j), as f16
+// (d * (q - 8)), bit for bit what f32 math rounded to f16 gives: v_perm puts that byte of the tokens' words w0 / w1 in
+// bytes 0 and 2, each nibble n goes to bits 0-3 of a half, and 0x6400 | n is the f16 1024 + n. The scales come the
+// same way from s0 / s1. 11 VALU per two tokens and two channels (one channel per lane took 7, f32 math 10).
+static __device__ __forceinline__ void rq_fa_v2x2(unsigned w0, unsigned w1, unsigned s0, unsigned s1, unsigned qsel,
+                                                  unsigned dsel, rq_fa_h2 & lo, rq_fa_h2 & hi) {
+    const unsigned x = __builtin_amdgcn_perm(w1, w0, qsel);
+    const rq_fa_h2 d = __builtin_bit_cast(rq_fa_h2, __builtin_amdgcn_perm(s1, s0, dsel));
+    const rq_fa_h2 o = { (_Float16) 1032.0f, (_Float16) 1032.0f };
+    lo = (__builtin_bit_cast(rq_fa_h2, (x & 0x000F000Fu) | 0x64006400u) - o) * d;
+    hi = (__builtin_bit_cast(rq_fa_h2, (x >> 4 & 0x000F000Fu) | 0x64006400u) - o) * d;
+}
+
+// LDS: K and V tiles, P (f16), m / l / alpha per row, and the tile's mask per query token (f16). P at a 16-byte aligned
+// offset the compiler can see: behind m / l / alpha its reads went from ds_read_b128 to two ds_read2_b32 with a v_mov
+// for each address (48 reads and 33 v_mov per 8 tokens at 24 rows instead of 24 reads).
+static constexpr size_t rq_fa_lds_bytes(int rmax, int ncols) {
+    return sizeof(int) * 2 * RQ_FA_TILE * RQ_FA_ROWW + sizeof(_Float16) * (rmax + ncols) * RQ_FA_TILE + sizeof(float) * 3 * rmax;
+}
+
+// grid (chunks, KV heads), 2 NGR NGT waves. R = gqa * ncols query rows per KV head, at most RMAX.
+// The waves come in pairs, each pair covering the 256 channels in P.V, two per lane: NGR pairs split the rows
+// (2 RMAX / NGR accumulators per lane), NGT pairs split each tile's tokens and add up at the end. Either way the K and V
+// tiles in LDS are shared by more waves: 2 waves per SIMD before (112 VGPRs and 30 KB of LDS at 4 waves per
+// workgroup, 54% of the waves' time waiting at 64k), 4 now.
+// Two channels per lane because P.V was bound by LDS bandwidth once the waves stopped waiting: P is the same for every
+// lane, and each 64-lane broadcast ds_read_b128 returns 1 KB for 16 bytes of P (24 per 8 tokens per wave at one
+// channel per lane, ~3.6k LDS cycles per CU against 2.1k VALU cycles per SIMD; without Q.K, P.V alone took 707 of
+// 1114 us at 64k and 8 tokens).
+template <int RMAX, int NGR, int NGT, int QB>
+static __global__ void __launch_bounds__(128 * NGR * NGT) __attribute__((amdgpu_waves_per_eu(4))) rq_fa_q4_kernel(
         const int * __restrict__ Qq, const float * __restrict__ Qd, const char * __restrict__ K, const char * __restrict__ V,
         const char * __restrict__ mask, float * __restrict__ parts, float2 * __restrict__ meta, float * __restrict__ dst,
         size_t nbk1, size_t nbk2, size_t nbv1, size_t nbv2, size_t nbm1,
         int R, int ncols, int gqa, int nheads, int n_kv, int chunk) {
-    __shared__ int   ks[RQ_FA_TILE * RQ_FA_ROWW];
-    __shared__ int   vs[RQ_FA_TILE * RQ_FA_ROWW];
-    __shared__ _Float16 ps[RMAX * RQ_FA_TILE];
-    __shared__ float ms[RMAX], ls[RMAX], as[RMAX];
-    __shared__ float mk[16 * RQ_FA_TILE]; // the tile's mask, per query token (-inf past the cache)
+    constexpr int NW  = 2 * NGR * NGT;
+    constexpr int RH  = RMAX / NGR;          // rows per group in P.V
+    constexpr int TT  = RQ_FA_TILE / NGT;    // tokens per group and tile in P.V
+    constexpr int RPW = (RMAX + NW - 1) / NW; // rows per wave in Q.K: wave RPW .. wave RPW + RPW - 1
+    static_assert(RMAX % NGR == 0 && TT % 8 == 0 && RMAX % RPW == 0, "rows and tokens must split evenly");
+    static_assert((NGT - 1) * RMAX * RQ_FA_D <= 2 * RQ_FA_TILE * RQ_FA_ROWW, "the token groups' sums must fit the K / V tiles");
+    extern __shared__ __attribute__((aligned(16))) int rq_fa_lds[];
+    static_assert(2 * RQ_FA_TILE * RQ_FA_ROWW % 4 == 0, "P must start 16-byte aligned");
+    int * ks = rq_fa_lds;                                     // [TILE][ROWW]
+    int * vs = ks + RQ_FA_TILE * RQ_FA_ROWW;                  // [TILE][ROWW]
+    _Float16 * ps = (_Float16 *) (rq_fa_lds + 2 * RQ_FA_TILE * RQ_FA_ROWW); // [RMAX][TILE]
+    float * ms = (float *) (ps + RMAX * RQ_FA_TILE), * ls = ms + RMAX, * as = ls + RMAX;
+    _Float16 * mk = (_Float16 *) (as + RMAX);                 // [ncols][TILE], -inf past the cache
 
     const int g = blockIdx.y, nchunks = gridDim.x;
     const int t_begin = blockIdx.x * chunk, t_end = min(t_begin + chunk, n_kv);
     const int lane = threadIdx.x % 64;
     const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x / 64);
-    const int c = wave * 64 + lane; // this lane's output channel
+    const int gr = wave / 2 % NGR, gt = wave / 2 / NGR; // this wave's P.V group: rows gr RH.., tokens gt TT..
+    const int rbase = gr * RH;
     const char * Kg = K + (size_t) g * nbk2;
     const char * Vg = V + (size_t) g * nbv2;
 
-    for (int r = threadIdx.x; r < RMAX; r += 256) {
+    for (int r = threadIdx.x; r < RMAX; r += 64 * NW) {
         ms[r] = -INFINITY;
         ls[r] = 0.0f;
         as[r] = 1.0f;
     }
-    // P.V runs over all RMAX rows without branches (a guard per row made each row wait out its own LDS read): the rows
-    // past R keep P = 0
-    for (int i = threadIdx.x; i < (RMAX - R) * RQ_FA_TILE; i += 256) ps[R * RQ_FA_TILE + i] = (_Float16) 0.0f;
-    float acc[RMAX];
+    // P.V runs over all rows without branches (a guard per row made each row wait out its own LDS read): the rows past
+    // R keep P = 0
+    for (int i = threadIdx.x; i < (RMAX - R) * RQ_FA_TILE; i += 64 * NW) ps[R * RQ_FA_TILE + i] = (_Float16) 0.0f;
+    float acc[RH][2];
 #pragma unroll
-    for (int r = 0; r < RMAX; ++r) acc[r] = 0.0f;
+    for (int r = 0; r < RH; ++r) acc[r][0] = acc[r][1] = 0.0f;
+
+    // P.V: the lane's channels c and c + 16 of block cb, the low and high nibble of byte cb * 18 + 2 + c % 16 of a token
+    // row; the block's scale is the f16 at byte 18 cb. v_perm selectors for rq_fa_v2x2: that byte of two tokens, those
+    // two bytes of two tokens.
+    const int l2 = wave % 2 * 64 + lane, cb = l2 / 16, c = cb * 32 + l2 % 16;
+    const int cbyte = cb * 18 + 2 + l2 % 16, cw = cbyte >> 2, sw = 18 * cb >> 2;
+    const unsigned qb = cbyte & 3, hb = 18 * cb & 3;
+    const unsigned qsel = qb | 0x0cu << 8 | (4 + qb) << 16 | 0x0cu << 24;
+    const unsigned dsel = hb | (hb + 1) << 8 | (4 + hb) << 16 | (5 + hb) << 24;
 
     for (int t0 = t_begin; t0 < t_end; t0 += RQ_FA_TILE) {
         // K and V rows of the tile into LDS, 36 words each
-        for (int i = threadIdx.x; i < RQ_FA_TILE * 36; i += 256) {
-            const int tr = i / 36, cw = i % 36;
+        for (int i = threadIdx.x; i < RQ_FA_TILE * 36; i += 64 * NW) {
+            const int tr = i / 36, cwi = i % 36;
             const bool in = t0 + tr < t_end;
-            ks[tr * RQ_FA_ROWW + cw] = in ? *(const int *) (Kg + (size_t) (t0 + tr) * nbk1 + 4 * cw) : 0;
-            vs[tr * RQ_FA_ROWW + cw] = in ? *(const int *) (Vg + (size_t) (t0 + tr) * nbv1 + 4 * cw) : 0;
+            ks[tr * RQ_FA_ROWW + cwi] = in ? *(const int *) (Kg + (size_t) (t0 + tr) * nbk1 + 4 * cwi) : 0;
+            vs[tr * RQ_FA_ROWW + cwi] = in ? *(const int *) (Vg + (size_t) (t0 + tr) * nbv1 + 4 * cwi) : 0;
         }
         // each query row reads its token's mask from LDS: as a global load per row it was a round trip per row
-        for (int i = threadIdx.x; i < ncols * RQ_FA_TILE; i += 256) {
+        for (int i = threadIdx.x; i < ncols * RQ_FA_TILE; i += 64 * NW) {
             const int col = i / RQ_FA_TILE, tt = i % RQ_FA_TILE;
-            const bool in = t0 + tt < t_end;
-            mk[i] = !in ? -INFINITY : mask ? __half2float(((const half *) (mask + (size_t) col * nbm1))[t0 + tt]) : 0.0f;
+            mk[i] = t0 + tt >= t_end ? (_Float16) -INFINITY :
+                    mask ? (_Float16) __half2float(((const half *) (mask + (size_t) col * nbm1))[t0 + tt]) : (_Float16) 0.0f;
         }
         __syncthreads();
 
-        // Q.K and the online softmax: lane = token t0 + lane, this wave's rows
-        {
+        // Q.K and the online softmax: lane = token t0 + lane, the wave's RPW rows; block by block, so that one q4_0
+        // block of the token's K row is live instead of all eight (40 VGPRs held across the rows), with the block's Q of
+        // all those rows in scalar registers. Rows past R have Q = 0 (a guard per row and block compiled to a branch,
+        // a scalar load and a wait each: +23% VALU, 5x the scalar loads). Not unrolled: unrolled, the compiler hoists
+        // every block's scalar loads, runs out of SGPRs and moves Q to VGPRs (89 VGPRs at 48 rows, spills at 96).
+        if (wave * RPW < RMAX) {
             const int * kr = ks + lane * RQ_FA_ROWW;
-            int kq[32];
-            float dk[8];
+            float s[RPW];
 #pragma unroll
-            for (int b = 0; b < 8; ++b) {
-                dk[b] = rq_fa_half(kr, 18 * b);
-#pragma unroll
-                for (int j = 0; j < 4; ++j) kq[b * 4 + j] = rq_fa_bytes(kr, 18 * b + 2 + 4 * j) ^ 0x88888888;
-            }
+            for (int i = 0; i < RPW; ++i) s[i] = 0.0f;
 #pragma unroll 1
-            for (int r = wave; r < R; r += 4) {
-                const int * q = Qq + ((size_t) g * R + r) * QB * 32;
-                const float * qd = Qd + ((size_t) g * R + r) * 8;
-                float s = 0.0f;
+            for (int b = 0; b < 8; ++b) {
+                const int   * q  = Qq + (((size_t) g * 8 + b) * RMAX + wave * RPW) * QB * 4;
+                const float * qd = Qd + ((size_t) g * 8 + b) * RMAX + wave * RPW;
+                const float dk = rq_fa_half(kr, 18 * b);
+                int kq[4];
 #pragma unroll
-                for (int b = 0; b < 8; ++b) {
+                for (int j = 0; j < 4; ++j) kq[j] = rq_fa_bytes(kr, 18 * b + 2 + 4 * j) ^ 0x88888888;
+#pragma unroll
+                for (int i = 0; i < RPW; ++i) {
                     int sb = 0;
 #pragma unroll
-                    for (int j = 0; j < 4; ++j) sb = rq_fa_dot8(q[b * 4 + j], kq[b * 4 + j], sb);
+                    for (int j = 0; j < 4; ++j) sb = rq_fa_dot8(q[i * QB * 4 + j], kq[j], sb);
                     if (QB == 2) {
                         int sl = 0;
 #pragma unroll
-                        for (int j = 0; j < 4; ++j) sl = rq_fa_dot8(q[32 + b * 4 + j], kq[b * 4 + j], sl);
+                        for (int j = 0; j < 4; ++j) sl = rq_fa_dot8(q[i * QB * 4 + 4 + j], kq[j], sl);
                         sb = 16 * sb + sl;
                     }
-                    s += (float) sb * (dk[b] * qd[b]);
+                    s[i] += (float) sb * (dk * qd[i]);
                 }
-                s += mk[(r % ncols) * RQ_FA_TILE + lane];
-                const float mt = rq_fa_wave_reduce<true>(s);
+            }
+#pragma unroll
+            for (int i = 0; i < RPW; ++i) {
+                const int r = wave * RPW + i;
+                if (r >= R) break;
+                const float si = s[i] + (float) mk[r % ncols * RQ_FA_TILE + lane];
+                // lazy rescaling, as in FlashAttention-4: the row's reference max moves only when a score passes it by
+                // more than RQ_FA_LAZY, so most tiles skip the max reduction (~25 VALU, half of it v_max canonicalizing
+                // DPP results) and rescale by 1. Keeping the sum of P per lane as well cost 12 VGPRs (75 at 48 rows).
                 const float m_old = ms[r];
-                const float m_new = fmaxf(m_old, mt);
-                const float p = m_new == -INFINITY ? 0.0f : __expf(s - m_new);
+                float m_new = m_old;
+                if (__any(si > m_old + RQ_FA_LAZY)) {
+                    m_new = fmaxf(m_old, rq_fa_wave_reduce<true>(si));
+                }
+                const float p = m_new == -INFINITY ? 0.0f : __expf(si - m_new);
                 const float lt = rq_fa_wave_reduce<false>(p);
                 ps[r * RQ_FA_TILE + lane] = (_Float16) p;
                 if (lane == 0) {
-                    const float alpha = m_new == -INFINITY ? 1.0f : __expf(m_old - m_new);
+                    const float alpha = m_new == m_old ? 1.0f : __expf(m_old - m_new);
                     ms[r] = m_new;
                     ls[r] = ls[r] * alpha + lt;
                     as[r] = alpha;
@@ -222,38 +292,43 @@ static __global__ void __launch_bounds__(256) rq_fa_q4_kernel(
         }
         __syncthreads();
 
-        // P.V: lane = channel c of block cb, byte cb * 18 + 2 + (c % 16) of a token row, nibble c % 32 / 16
+        // P.V over this group's rows and tokens
         {
-            const int cb = c / 32, cbyte = cb * 18 + 2 + (c % 16), csh = 4 * ((c % 32) / 16);
 #pragma unroll
-            for (int r = 0; r < RMAX; ++r) acc[r] *= as[r];
+            for (int r = 0; r < RH; ++r) {
+                const float a = as[rbase + r];
+                acc[r][0] *= a;
+                acc[r][1] *= a;
+            }
 #pragma unroll 1
-            for (int t = 0; t < RQ_FA_TILE; t += 8) {
-                rq_fa_h2 v2[4];
+            for (int t = gt * TT; t < gt * TT + TT; t += 8) {
+                rq_fa_h2 vlo[4], vhi[4];
 #pragma unroll
-                for (int k = 0; k < 8; ++k) {
-                    const int * vr = vs + (t + k) * RQ_FA_ROWW;
-                    const int q = (((unsigned) vr[cbyte >> 2] >> (8 * (cbyte & 3) + csh)) & 15) - 8;
-                    const _Float16 val = (_Float16) (rq_fa_half(vr, 18 * cb) * (float) q);
-                    if (k & 1) v2[k / 2].y = val; else v2[k / 2].x = val;
+                for (int k = 0; k < 4; ++k) {
+                    const int * vr = vs + (t + 2 * k) * RQ_FA_ROWW;
+                    rq_fa_v2x2(vr[cw], vr[RQ_FA_ROWW + cw], vr[sw], vr[RQ_FA_ROWW + sw], qsel, dsel, vlo[k], vhi[k]);
                 }
-                // P of 4 rows read before their dot2s, so that the LDS reads overlap (row by row, each waited out its
-                // read; more rows in flight cost VGPRs past 128 at RMAX 48). Rows per wave with 4 channels per lane, a
-                // quarter of the P reads, was measured: 64k verify 59.6 -> 59.1 ms, decode 38.5 -> 40.9 ms (each lane
-                // decodes V for 4 channels and, at 6 rows, uses each value for 2 rows). LDS bandwidth is not the limit:
-                // at 2 waves per SIMD the waves wait on latency 54% of the time (rocprofv3, REPORT 2026-11-06).
+                // P of up to 4 rows read before their dot2s, so that the LDS reads overlap (row by row, each waited out
+                // its read). Four channels per lane (rows per wave, a quarter of the P reads) was measured at 2 waves per
+                // SIMD: 64k verify 59.6 -> 59.1 ms, decode 38.5 -> 40.9 ms, as each lane decoded V for 4 channels from
+                // 2 bytes. The two channels here share one byte, so they decode for 11 VALU per two tokens, not 14.
 #pragma unroll
-                for (int r0 = 0; r0 < RMAX; r0 += 4) {
+                for (int r0 = 0; r0 < RH; r0 += 4) {
                     rq_fa_h2 pr[4][4];
 #pragma unroll
-                    for (int i = 0; i < 4; ++i) {
+                    for (int i = 0; i < 4 && r0 + i < RH; ++i) {
 #pragma unroll
-                        for (int k = 0; k < 4; ++k) pr[i][k] = ((const rq_fa_h2 *) (ps + (r0 + i) * RQ_FA_TILE + t))[k];
+                        for (int k = 0; k < 4; ++k) {
+                            pr[i][k] = ((const rq_fa_h2 *) __builtin_assume_aligned(ps + (rbase + r0 + i) * RQ_FA_TILE + t, 16))[k];
+                        }
                     }
 #pragma unroll
-                    for (int i = 0; i < 4; ++i) {
+                    for (int i = 0; i < 4 && r0 + i < RH; ++i) {
 #pragma unroll
-                        for (int k = 0; k < 4; ++k) acc[r0 + i] = rq_fa_dot2(pr[i][k], v2[k], acc[r0 + i]);
+                        for (int k = 0; k < 4; ++k) {
+                            acc[r0 + i][0] = rq_fa_dot2(pr[i][k], vlo[k], acc[r0 + i][0]);
+                            acc[r0 + i][1] = rq_fa_dot2(pr[i][k], vhi[k], acc[r0 + i][1]);
+                        }
                     }
                 }
             }
@@ -261,17 +336,44 @@ static __global__ void __launch_bounds__(256) rq_fa_q4_kernel(
         __syncthreads();
     }
 
+    // token groups past the first hand their sums to it through the (now free) K / V tiles
+    if (NGT > 1) {
+        float * red = (float *) ks; // [NGT - 1][RMAX][256]
+        if (gt > 0) {
+#pragma unroll
+            for (int r = 0; r < RH; ++r) {
+                red[((gt - 1) * RMAX + rbase + r) * RQ_FA_D + c]      = acc[r][0];
+                red[((gt - 1) * RMAX + rbase + r) * RQ_FA_D + c + 16] = acc[r][1];
+            }
+        }
+        __syncthreads();
+        if (gt > 0) {
+            return;
+        }
+#pragma unroll
+        for (int k = 1; k < NGT; ++k) {
+#pragma unroll
+            for (int r = 0; r < RH; ++r) {
+                acc[r][0] += red[((k - 1) * RMAX + rbase + r) * RQ_FA_D + c];
+                acc[r][1] += red[((k - 1) * RMAX + rbase + r) * RQ_FA_D + c + 16];
+            }
+        }
+    }
+
     // the chunk's unnormalized sums and (max, sum) per row, or the normalized output if there is one chunk
 #pragma unroll
-    for (int r = 0; r < RMAX; ++r) {
-        if (r >= R) continue;
-        const int h = g * gqa + r / ncols, col = r % ncols;
+    for (int r = 0; r < RH; ++r) {
+        const int rr = rbase + r;
+        if (rr >= R) continue;
+        const int h = g * gqa + rr / ncols, col = rr % ncols;
         const size_t jdst = (size_t) col * nheads + h;
         if (nchunks == 1) {
-            dst[jdst * RQ_FA_D + c] = ls[r] > 0.0f ? acc[r] / ls[r] : 0.0f;
+            dst[jdst * RQ_FA_D + c]      = ls[rr] > 0.0f ? acc[r][0] / ls[rr] : 0.0f;
+            dst[jdst * RQ_FA_D + c + 16] = ls[rr] > 0.0f ? acc[r][1] / ls[rr] : 0.0f;
         } else {
-            parts[(jdst * nchunks + blockIdx.x) * RQ_FA_D + c] = acc[r];
-            if (threadIdx.x == 0) meta[jdst * nchunks + blockIdx.x] = make_float2(ms[r], ls[r]);
+            parts[(jdst * nchunks + blockIdx.x) * RQ_FA_D + c]      = acc[r][0];
+            parts[(jdst * nchunks + blockIdx.x) * RQ_FA_D + c + 16] = acc[r][1];
+            if (c == 0) meta[jdst * nchunks + blockIdx.x] = make_float2(ms[rr], ls[rr]);
         }
     }
 }
@@ -303,67 +405,72 @@ bool ggml_cuda_rq_fattn_q4_applies(const ggml_tensor * dst) {
            !sinks && max_bias == 0.0f && softcap == 0.0f;
 }
 
-template <int RMAX, int QB>
-static void rq_fa_launch(dim3 grid, cudaStream_t s, const int * Qq, const float * Qd, const ggml_tensor * K, const ggml_tensor * V,
-                         const ggml_tensor * mask, float * parts, float2 * meta, float * dst, int R, int ncols, int gqa, int nheads,
-                         int chunk) {
-    rq_fa_q4_kernel<RMAX, QB><<<grid, 256, 0, s>>>(Qq, Qd, (const char *) K->data, (const char *) V->data,
-                                                   mask ? (const char *) mask->data : nullptr, parts, meta, dst, K->nb[1], K->nb[2],
-                                                   V->nb[1], V->nb[2], mask ? mask->nb[1] : 0, R, ncols, gqa, nheads, (int) K->ne[1],
-                                                   chunk);
-}
-
-template <int QB>
-static void rq_fa_launch_r(int R, dim3 grid, cudaStream_t s, const int * Qq, const float * Qd, const ggml_tensor * K,
-                           const ggml_tensor * V, const ggml_tensor * mask, float * parts, float2 * meta, float * dst, int ncols,
-                           int gqa, int nheads, int chunk) {
-    if (R <= 8)       rq_fa_launch<8,  QB>(grid, s, Qq, Qd, K, V, mask, parts, meta, dst, R, ncols, gqa, nheads, chunk);
-    else if (R <= 16) rq_fa_launch<16, QB>(grid, s, Qq, Qd, K, V, mask, parts, meta, dst, R, ncols, gqa, nheads, chunk);
-    else if (R <= 32) rq_fa_launch<32, QB>(grid, s, Qq, Qd, K, V, mask, parts, meta, dst, R, ncols, gqa, nheads, chunk);
-    else if (R <= 48) rq_fa_launch<48, QB>(grid, s, Qq, Qd, K, V, mask, parts, meta, dst, R, ncols, gqa, nheads, chunk);
-    else              rq_fa_launch<96, QB>(grid, s, Qq, Qd, K, V, mask, parts, meta, dst, R, ncols, gqa, nheads, chunk);
-}
-
-void ggml_cuda_rq_fattn_q4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// Q quantization, the chunked attention and the combine for one shape. The KV sequence is split into as many chunks as
+// workgroups fit on the GPU at once (registers and LDS, from the runtime), whole tiles each.
+template <int RMAX, int NGR, int NGT, int QB>
+static void rq_fa_run(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, float scale, int ncols, int gqa) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
     cudaStream_t s = ctx.stream();
-    float scale = 1.0f;
-    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    const int nheads = (int) Q->ne[2], nkvh = (int) K->ne[2], R = gqa * ncols;
 
-    const int ncols = (int) Q->ne[1], nheads = (int) Q->ne[2], nkvh = (int) K->ne[2];
-    const int gqa = nheads / nkvh, R = gqa * ncols;
-    const int QB = rq_fa_mode() == 2 ? 2 : 1;
+    ggml_cuda_pool_alloc<int>   Qq(ctx.pool(), (size_t) nkvh * 8 * RMAX * QB * 4);
+    ggml_cuda_pool_alloc<float> Qd(ctx.pool(), (size_t) nkvh * 8 * RMAX);
+    rq_fa_quant_q<QB><<<nkvh * RMAX, 64, 0, s>>>((const char *) Q->data, Q->nb[1], Q->nb[2], ncols, gqa, RMAX, scale, Qq.get(), Qd.get());
+    const size_t lds = rq_fa_lds_bytes(RMAX, ncols);
+    const auto kernel = rq_fa_q4_kernel<RMAX, NGR, NGT, QB>;
 
-    ggml_cuda_pool_alloc<int>   Qq(ctx.pool(), (size_t) nheads * ncols * QB * 32);
-    ggml_cuda_pool_alloc<float> Qd(ctx.pool(), (size_t) nheads * ncols * 8);
-    if (QB == 1) {
-        rq_fa_quant_q<1><<<nheads * ncols, 64, 0, s>>>((const char *) Q->data, Q->nb[1], Q->nb[2], ncols, gqa, scale, Qq.get(), Qd.get());
-    } else {
-        rq_fa_quant_q<2><<<nheads * ncols, 64, 0, s>>>((const char *) Q->data, Q->nb[1], Q->nb[2], ncols, gqa, scale, Qq.get(), Qd.get());
+    const int dev = ggml_cuda_get_device();
+    static int resident[GGML_CUDA_MAX_DEVICES][17] = {}; // workgroups per CU, by ncols (the mask's LDS)
+    if (resident[dev][ncols] == 0) {
+        int n = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kernel, 128 * NGR * NGT, lds));
+        resident[dev][ncols] = std::max(1, n);
     }
-
-    // the KV sequence over ~2 workgroups per CU, whole tiles each
     const int ntiles = (int) K->ne[1] / RQ_FA_TILE;
-    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    const int nsm = ggml_cuda_info().devices[dev].nsm;
     static const int env_chunks = getenv("RQ_FA_CHUNKS") ? atoi(getenv("RQ_FA_CHUNKS")) : 0;
-    int nchunks = env_chunks > 0 ? env_chunks : std::max(1, std::min(ntiles, (2 * nsm + nkvh - 1) / nkvh));
+    int nchunks = env_chunks > 0 ? env_chunks : std::max(1, std::min(ntiles, (resident[dev][ncols] * nsm + nkvh - 1) / nkvh));
     const int chunk = (ntiles + nchunks - 1) / nchunks * RQ_FA_TILE;
     nchunks = (int) ((K->ne[1] + chunk - 1) / chunk);
 
     ggml_cuda_pool_alloc<float>  parts(ctx.pool(), nchunks > 1 ? (size_t) nchunks * nheads * ncols * RQ_FA_D : 1);
     ggml_cuda_pool_alloc<float2> meta(ctx.pool(), nchunks > 1 ? (size_t) nchunks * nheads * ncols : 1);
-    const dim3 grid(nchunks, nkvh, 1);
-    if (QB == 1) {
-        rq_fa_launch_r<1>(R, grid, s, Qq.get(), Qd.get(), K, V, mask, parts.get(), meta.get(), (float *) dst->data, ncols, gqa, nheads, chunk);
-    } else {
-        rq_fa_launch_r<2>(R, grid, s, Qq.get(), Qd.get(), K, V, mask, parts.get(), meta.get(), (float *) dst->data, ncols, gqa, nheads, chunk);
-    }
+    float * d = (float *) dst->data;
+    kernel<<<dim3(nchunks, nkvh, 1), 128 * NGR * NGT, lds, s>>>(
+        Qq.get(), Qd.get(), (const char *) K->data, (const char *) V->data, mask ? (const char *) mask->data : nullptr, parts.get(), meta.get(),
+        d, K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask ? mask->nb[1] : 0, R, ncols, gqa, nheads, (int) K->ne[1], chunk);
     if (nchunks > 1) {
         flash_attn_combine_results<RQ_FA_D><<<dim3(ncols, nheads, 1), RQ_FA_D, nchunks * sizeof(float2), s>>>(
-            parts.get(), meta.get(), (float *) dst->data, nchunks);
+            parts.get(), meta.get(), d, nchunks);
+    }
+}
+
+// accumulators per lane in P.V at most 24 (2 RMAX / NGR): with the Q.K block loop that keeps every width under 64 VGPRs.
+// At decode width (6 rows) the pairs of waves split each tile's tokens instead, so that V is decoded once.
+template <int QB>
+static void rq_fa_run_r(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, float scale, int R, int ncols, int gqa) {
+    if (R <= 6)       rq_fa_run<6,  1, 4, QB>(ctx, dst, scale, ncols, gqa);
+    else if (R <= 12) rq_fa_run<12, 2, 2, QB>(ctx, dst, scale, ncols, gqa);
+    else if (R <= 24) rq_fa_run<24, 4, 1, QB>(ctx, dst, scale, ncols, gqa);
+    else if (R <= 48) rq_fa_run<48, 4, 1, QB>(ctx, dst, scale, ncols, gqa);
+    else              rq_fa_run<96, 8, 1, QB>(ctx, dst, scale, ncols, gqa);
+}
+
+void ggml_cuda_rq_fattn_q4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    const int ncols = (int) Q->ne[1], nheads = (int) Q->ne[2], nkvh = (int) K->ne[2];
+    const int gqa = nheads / nkvh, R = gqa * ncols;
+    if (rq_fa_mode() == 2) {
+        rq_fa_run_r<2>(ctx, dst, scale, R, ncols, gqa);
+    } else {
+        rq_fa_run_r<1>(ctx, dst, scale, R, ncols, gqa);
     }
     CUDA_CHECK(cudaGetLastError());
 }
