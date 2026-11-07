@@ -13,7 +13,8 @@
 //     the tokens), Q from scalar loads; online softmax per row with lazy rescaling, P to LDS as f16.
 //     P.V: pairs of waves cover the 256 output channels, two per lane (the two nibbles of a byte); each lane decodes its
 //     channels of V for 8 tokens once and uses them for every row of its pair (v_dot2 with f32 accumulation).
-//   - Partial results go through llama.cpp's flash_attn_combine_results.
+//   - Partial results go through our own combine (rq_fa_combine) on gfx906, llama.cpp's flash_attn_combine_results on
+//     NVIDIA.
 // On NVIDIA GPUs with INT4 tensor cores (the #else branch) the same numerics run on mma.sync: m16n8k32 .s4 per q4_0
 // block for Q.K, f16 m16n8k16 for P.V.
 #include "common.cuh"
@@ -27,7 +28,8 @@
 
 #define RQ_FA_D    256
 #define RQ_FA_TILE 64
-#define RQ_FA_ROWW 37 // LDS words per token row of K / V: 36 (8 q4_0 blocks of 18 bytes) + 1 against bank conflicts
+#define RQ_FA_ROWW 37 // LDS words per token row of V: 36 (8 q4_0 blocks of 18 bytes) + 1 against bank conflicts
+#define RQ_FA_KROW 36 // LDS words per token row of prepared K: 8 blocks of 4 nibble words (16-byte aligned rows)
 #define RQ_FA_LAZY 8.0f // a row's reference max moves when a score passes it by more than this: P <= e^8 = 2981 in f16
 
 typedef _Float16 rq_fa_h2 __attribute__((ext_vector_type(2)));
@@ -72,6 +74,24 @@ static __device__ __forceinline__ float rq_fa_wave_reduce(float v) {
     const float c = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(v), 32));
     const float d = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(v), 48));
     return op(op(a, b), op(c, d));
+}
+
+// sum over the wave: shifts within each row of 16 lanes make a prefix sum per row, two row broadcasts add the rows;
+// lane 63 ends with the total. 7 DPP adds and a readlane (the butterfly above took ~14 VALU and 4 readlanes).
+template <int CTRL, int ROW_MASK, int BANK_MASK>
+static __device__ __forceinline__ float rq_fa_dpp(float x) { // lanes the masks leave out, and lanes past the row, get 0
+    return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), CTRL, ROW_MASK, BANK_MASK, true));
+}
+
+static __device__ __forceinline__ float rq_fa_wave_sum(float v) {
+    float s = v + rq_fa_dpp<0x111, 0xF, 0xF>(v); // row_shr:1
+    s += rq_fa_dpp<0x112, 0xF, 0xF>(v);          // row_shr:2
+    s += rq_fa_dpp<0x113, 0xF, 0xF>(v);          // row_shr:3
+    s += rq_fa_dpp<0x114, 0xF, 0xE>(s);          // row_shr:4, lanes 4-15 of each row
+    s += rq_fa_dpp<0x118, 0xF, 0xC>(s);          // row_shr:8, lanes 8-15
+    s += rq_fa_dpp<0x142, 0xA, 0xF>(s);          // row_bcast:15, rows 1 and 3
+    s += rq_fa_dpp<0x143, 0xC, 0xF>(s);          // row_bcast:31, rows 2 and 3
+    return __int_as_float(__builtin_amdgcn_readlane(__float_as_int(s), 63));
 }
 
 static __device__ __forceinline__ float rq_fa_half(const int * w, int o) { // f16 at an even byte offset
@@ -152,11 +172,13 @@ static __device__ __forceinline__ void rq_fa_v2x2(unsigned w0, unsigned w1, unsi
     hi = (__builtin_bit_cast(rq_fa_h2, (x >> 4 & 0x000F000Fu) | 0x64006400u) - o) * d;
 }
 
-// LDS: K and V tiles, P (f16), m / l / alpha per row, and the tile's mask per query token (f16). P at a 16-byte aligned
-// offset the compiler can see: behind m / l / alpha its reads went from ds_read_b128 to two ds_read2_b32 with a v_mov
-// for each address (48 reads and 33 v_mov per 8 tokens at 24 rows instead of 24 reads).
+// LDS: the tile's K prepared for Q.K (nibble words and f32 scales), its V as stored, P (f16), m / l / alpha per row,
+// and the tile's mask per query token (f16). P at a 16-byte aligned offset the compiler can see: behind m / l / alpha
+// its reads went from ds_read_b128 to two ds_read2_b32 with a v_mov for each address (48 reads and 33 v_mov per 8
+// tokens at 24 rows instead of 24 reads).
+#define RQ_FA_KV_WORDS (RQ_FA_TILE * RQ_FA_KROW + 8 * RQ_FA_TILE + RQ_FA_TILE * RQ_FA_ROWW)
 static constexpr size_t rq_fa_lds_bytes(int rmax, int ncols) {
-    return sizeof(int) * 2 * RQ_FA_TILE * RQ_FA_ROWW + sizeof(_Float16) * (rmax + ncols) * RQ_FA_TILE + sizeof(float) * 3 * rmax;
+    return sizeof(int) * RQ_FA_KV_WORDS + sizeof(_Float16) * (rmax + ncols) * RQ_FA_TILE + sizeof(float) * 3 * rmax;
 }
 
 // grid (chunks, KV heads), 2 NGR NGT waves. R = gqa * ncols query rows per KV head, at most RMAX.
@@ -179,12 +201,13 @@ static __global__ void __launch_bounds__(128 * NGR * NGT) __attribute__((amdgpu_
     constexpr int TT  = RQ_FA_TILE / NGT;    // tokens per group and tile in P.V
     constexpr int RPW = (RMAX + NW - 1) / NW; // rows per wave in Q.K: wave RPW .. wave RPW + RPW - 1
     static_assert(RMAX % NGR == 0 && TT % 8 == 0 && RMAX % RPW == 0, "rows and tokens must split evenly");
-    static_assert((NGT - 1) * RMAX * RQ_FA_D <= 2 * RQ_FA_TILE * RQ_FA_ROWW, "the token groups' sums must fit the K / V tiles");
+    static_assert((NGT - 1) * RMAX * RQ_FA_D <= RQ_FA_KV_WORDS, "the token groups' sums must fit the K / V tiles");
     extern __shared__ __attribute__((aligned(16))) int rq_fa_lds[];
-    static_assert(2 * RQ_FA_TILE * RQ_FA_ROWW % 4 == 0, "P must start 16-byte aligned");
-    int * ks = rq_fa_lds;                                     // [TILE][ROWW]
-    int * vs = ks + RQ_FA_TILE * RQ_FA_ROWW;                  // [TILE][ROWW]
-    _Float16 * ps = (_Float16 *) (rq_fa_lds + 2 * RQ_FA_TILE * RQ_FA_ROWW); // [RMAX][TILE]
+    static_assert(RQ_FA_TILE * RQ_FA_KROW % 4 == 0 && RQ_FA_KV_WORDS % 4 == 0, "K rows and P must be 16-byte aligned");
+    int   * ks  = rq_fa_lds;                                  // [TILE][KROW] nibble words, top bits flipped
+    float * dks = (float *) (ks + RQ_FA_TILE * RQ_FA_KROW);   // [8][TILE] K scales
+    int   * vs  = (int *) (dks + 8 * RQ_FA_TILE);             // [TILE][ROWW] V rows as stored
+    _Float16 * ps = (_Float16 *) (rq_fa_lds + RQ_FA_KV_WORDS); // [RMAX][TILE]
     float * ms = (float *) (ps + RMAX * RQ_FA_TILE), * ls = ms + RMAX, * as = ls + RMAX;
     _Float16 * mk = (_Float16 *) (as + RMAX);                 // [ncols][TILE], -inf past the cache
 
@@ -219,12 +242,28 @@ static __global__ void __launch_bounds__(128 * NGR * NGT) __attribute__((amdgpu_
     const unsigned dsel = hb | (hb + 1) << 8 | (4 + hb) << 16 | (5 + hb) << 24;
 
     for (int t0 = t_begin; t0 < t_end; t0 += RQ_FA_TILE) {
-        // K and V rows of the tile into LDS, 36 words each
+        // K, one (token, q4_0 block) per thread: the block's 16 bytes of nibbles as 4 aligned words with their top bits
+        // flipped (q - 8 as signed int4 for v_dot8), its scale as f32. Each wave used to extract them from the raw row
+        // itself, every wave every token, ~10 VALU per block and wave.
+        for (int i = threadIdx.x; i < RQ_FA_TILE * 8; i += 64 * NW) {
+            const int tr = i / 8, b = i % 8;
+            int4  kw = make_int4(0, 0, 0, 0);
+            float d  = 0.0f;
+            if (t0 + tr < t_end) {
+                const int * row = (const int *) (Kg + (size_t) (t0 + tr) * nbk1);
+                const int o = 18 * b + 2, sh = o & 3; // the nibbles' byte offset in the row: 2 or 0 past a word start
+                const int * w = row + (o >> 2);
+                const unsigned w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3], w4 = sh ? w[4] : 0u;
+                kw = make_int4(__builtin_amdgcn_alignbyte(w1, w0, sh) ^ 0x88888888, __builtin_amdgcn_alignbyte(w2, w1, sh) ^ 0x88888888,
+                               __builtin_amdgcn_alignbyte(w3, w2, sh) ^ 0x88888888, __builtin_amdgcn_alignbyte(w4, w3, sh) ^ 0x88888888);
+                d = rq_fa_half(row, 18 * b);
+            }
+            *(int4 *) (ks + tr * RQ_FA_KROW + 4 * b) = kw;
+            dks[b * RQ_FA_TILE + tr] = d;
+        }
         for (int i = threadIdx.x; i < RQ_FA_TILE * 36; i += 64 * NW) {
             const int tr = i / 36, cwi = i % 36;
-            const bool in = t0 + tr < t_end;
-            ks[tr * RQ_FA_ROWW + cwi] = in ? *(const int *) (Kg + (size_t) (t0 + tr) * nbk1 + 4 * cwi) : 0;
-            vs[tr * RQ_FA_ROWW + cwi] = in ? *(const int *) (Vg + (size_t) (t0 + tr) * nbv1 + 4 * cwi) : 0;
+            vs[tr * RQ_FA_ROWW + cwi] = t0 + tr < t_end ? *(const int *) (Vg + (size_t) (t0 + tr) * nbv1 + 4 * cwi) : 0;
         }
         // each query row reads its token's mask from LDS: as a global load per row it was a round trip per row
         for (int i = threadIdx.x; i < ncols * RQ_FA_TILE; i += 64 * NW) {
@@ -240,7 +279,7 @@ static __global__ void __launch_bounds__(128 * NGR * NGT) __attribute__((amdgpu_
         // a scalar load and a wait each: +23% VALU, 5x the scalar loads). Not unrolled: unrolled, the compiler hoists
         // every block's scalar loads, runs out of SGPRs and moves Q to VGPRs (89 VGPRs at 48 rows, spills at 96).
         if (wave * RPW < RMAX) {
-            const int * kr = ks + lane * RQ_FA_ROWW;
+            const int * kr = ks + lane * RQ_FA_KROW;
             float s[RPW];
 #pragma unroll
             for (int i = 0; i < RPW; ++i) s[i] = 0.0f;
@@ -248,10 +287,9 @@ static __global__ void __launch_bounds__(128 * NGR * NGT) __attribute__((amdgpu_
             for (int b = 0; b < 8; ++b) {
                 const int   * q  = Qq + (((size_t) g * 8 + b) * RMAX + wave * RPW) * QB * 4;
                 const float * qd = Qd + ((size_t) g * 8 + b) * RMAX + wave * RPW;
-                const float dk = rq_fa_half(kr, 18 * b);
-                int kq[4];
-#pragma unroll
-                for (int j = 0; j < 4; ++j) kq[j] = rq_fa_bytes(kr, 18 * b + 2 + 4 * j) ^ 0x88888888;
+                const float dk = dks[b * RQ_FA_TILE + lane];
+                const int4  kw = *(const int4 *) (kr + 4 * b);
+                const int kq[4] = { kw.x, kw.y, kw.z, kw.w };
 #pragma unroll
                 for (int i = 0; i < RPW; ++i) {
                     int sb = 0;
@@ -280,7 +318,7 @@ static __global__ void __launch_bounds__(128 * NGR * NGT) __attribute__((amdgpu_
                     m_new = fmaxf(m_old, rq_fa_wave_reduce<true>(si));
                 }
                 const float p = m_new == -INFINITY ? 0.0f : __expf(si - m_new);
-                const float lt = rq_fa_wave_reduce<false>(p);
+                const float lt = rq_fa_wave_sum(p);
                 ps[r * RQ_FA_TILE + lane] = (_Float16) p;
                 if (lane == 0) {
                     const float alpha = m_new == m_old ? 1.0f : __expf(m_old - m_new);
@@ -378,6 +416,50 @@ static __global__ void __launch_bounds__(128 * NGR * NGT) __attribute__((amdgpu_
     }
 }
 
+// The chunks' partial sums into the output. grid (ncols * nheads rows, 4 quarters of the channels), 4 waves splitting
+// the chunks, lane = channel; each chunk's weight exp(m - max) once per block, in LDS. llama.cpp's
+// flash_attn_combine_results walks every chunk in one thread per channel, a dependent load and an expf each: at TP4 (one
+// KV head per GPU, 114 chunks) it took 50 us per 8-token verify call next to 244 us of attention, 29 next to 70 at decode.
+static __global__ void __launch_bounds__(256) rq_fa_combine(const float * __restrict__ parts, const float2 * __restrict__ meta,
+                                                            float * __restrict__ dst, int nchunks) {
+    extern __shared__ float rq_fa_w[];      // [nchunks] chunk weights
+    __shared__ float red[4][64], ml[2][4];
+    const int j = blockIdx.x, lane = threadIdx.x % 64, w = threadIdx.x / 64, c = blockIdx.y * 64 + lane;
+    parts += (size_t) j * nchunks * RQ_FA_D;
+    meta  += (size_t) j * nchunks;
+
+    float m = -INFINITY;
+    for (int i = threadIdx.x; i < nchunks; i += 256) m = fmaxf(m, meta[i].x);
+#pragma unroll
+    for (int o = 32; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o, 64));
+    if (lane == 0) ml[0][w] = m;
+    __syncthreads();
+    m = fmaxf(fmaxf(ml[0][0], ml[0][1]), fmaxf(ml[0][2], ml[0][3]));
+    float l = 0.0f;
+    for (int i = threadIdx.x; i < nchunks; i += 256) {
+        const float2 mi = meta[i];
+        const float wi = mi.x == -INFINITY ? 0.0f : __expf(mi.x - m);
+        rq_fa_w[i] = wi;
+        l += wi * mi.y;
+    }
+#pragma unroll
+    for (int o = 32; o > 0; o >>= 1) l += __shfl_xor(l, o, 64);
+    if (lane == 0) ml[1][w] = l;
+    __syncthreads();
+    l = ml[1][0] + ml[1][1] + ml[1][2] + ml[1][3];
+
+    float acc = 0.0f;
+#pragma unroll 4
+    for (int i = w; i < nchunks; i += 4) acc += rq_fa_w[i] * parts[(size_t) i * RQ_FA_D + c];
+    red[w][lane] = acc;
+    __syncthreads();
+    if (w == 0) {
+        // a fully masked row has l = 0 in every chunk: 0, as llama.cpp's combine writes
+        const float sum = red[0][lane] + red[1][lane] + red[2][lane] + red[3][lane];
+        dst[(size_t) j * RQ_FA_D + c] = l > 0.0f ? sum / l : 0.0f;
+    }
+}
+
 static int rq_fa_mode() {
     // on by default with int4 Q: at 8-token ubatches KLD 0.0423 (f16 cache 0.0416, stock q4_0 path 0.0442, int8 Q
     // 0.0425; 16 chunks, +-3%); 0 turns it off, 2 takes int8 Q
@@ -443,8 +525,7 @@ static void rq_fa_run(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, 
         Qq.get(), Qd.get(), (const char *) K->data, (const char *) V->data, mask ? (const char *) mask->data : nullptr, parts.get(), meta.get(),
         d, K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask ? mask->nb[1] : 0, R, ncols, gqa, nheads, (int) K->ne[1], chunk);
     if (nchunks > 1) {
-        flash_attn_combine_results<RQ_FA_D><<<dim3(ncols, nheads, 1), RQ_FA_D, nchunks * sizeof(float2), s>>>(
-            parts.get(), meta.get(), d, nchunks);
+        rq_fa_combine<<<dim3(ncols * nheads, RQ_FA_D / 64, 1), 256, nchunks * sizeof(float), s>>>(parts.get(), meta.get(), d, nchunks);
     }
 }
 
